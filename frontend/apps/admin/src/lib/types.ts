@@ -384,8 +384,8 @@ export interface Sub2APIAccountItem {
 }
 
 export interface AccountBatchImportBody {
-  /** 默认 lines；sub2api 为 JSON 分片导入 */
-  format?: 'lines' | 'sub2api';
+  /** 默认 lines；sub2api 为 JSON 分片导入；session_tokens 为 Session Token 导入 */
+  format?: 'lines' | 'sub2api' | 'session_tokens';
   provider: 'gpt' | 'grok';
   /** lines 模式必填 */
   auth_type?: 'api_key' | 'cookie' | 'oauth';
@@ -395,6 +395,7 @@ export interface AccountBatchImportBody {
   weight?: number;
   /**
    * lines：一行一条；支持 `<name>@@<credential>` / `<credential>@<base_url>` / `<credential>`。
+   * session_tokens：一行一个 session_token。
    */
   text?: string;
   /** sub2api：当前分片的账号列表（建议每批 ≤500） */
