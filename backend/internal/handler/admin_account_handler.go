@@ -126,8 +126,10 @@ func (h *AdminAccountHandler) BatchImport(c *gin.Context) {
 		}
 	case "lines":
 		// ok
+	case "session_tokens":
+		// ok - 批量导入 session token
 	default:
-		response.Fail(c, errcode.InvalidParam.WithMsg("format 仅支持 lines / sub2api"))
+		response.Fail(c, errcode.InvalidParam.WithMsg("format 仅支持 lines / sub2api / session_tokens"))
 		return
 	}
 	uid := middleware.UID(c)

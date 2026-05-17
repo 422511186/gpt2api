@@ -386,6 +386,7 @@ func (s *AccountAdminService) List(ctx context.Context, req *dto.AccountListReq)
 }
 
 // BatchImport 文本行导入（format=lines）或 sub2api JSON 分片导入（format=sub2api）。
+// 新增 format=session_tokens：每行一个 session token，自动填充占位的 access_token 和 refresh_token。
 func (s *AccountAdminService) BatchImport(ctx context.Context, adminID uint64, req *dto.AccountBatchImportReq) (*dto.BatchImportResult, error) {
 	format := strings.ToLower(strings.TrimSpace(req.Format))
 	if format == "" {
@@ -393,6 +394,9 @@ func (s *AccountAdminService) BatchImport(ctx context.Context, adminID uint64, r
 	}
 	if format == "sub2api" {
 		return s.batchImportSub2API(ctx, adminID, req)
+	}
+	if format == "session_tokens" {
+		return s.batchImportSessionTokens(ctx, adminID, req)
 	}
 	if strings.TrimSpace(req.AuthType) == "" {
 		return nil, errcode.InvalidParam.WithMsg("auth_type 不能为空")
@@ -619,6 +623,114 @@ func mapSub2APIPlatform(p string) string {
 	default:
 		return ""
 	}
+}
+
+// batchImportSessionTokens 批量导入 session token，每行一个 session token。
+// 自动填充占位的 access_token 和 refresh_token，auth_type 固定为 oauth。
+func (s *AccountAdminService) batchImportSessionTokens(ctx context.Context, adminID uint64, req *dto.AccountBatchImportReq) (*dto.BatchImportResult, error) {
+	if strings.TrimSpace(req.Text) == "" {
+		return nil, errcode.InvalidParam.WithMsg("text 不能为空")
+	}
+
+	provider := req.Provider
+	if provider == "" {
+		provider = model.ProviderGPT
+	}
+
+	weight := req.Weight
+	if weight <= 0 {
+		weight = 10
+	}
+
+	lines := strings.Split(req.Text, "\n")
+	items := make([]*model.Account, 0, len(lines))
+	skipped := 0
+
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// session token 作为主要凭证，同时填入 AT/RT 以便后续直接使用
+		st := line
+		name := fmt.Sprintf("session-%d-%s", i+1, shortTokenName(st))
+
+		// 加密 session token（用于 AT/RT/ST 三个字段）
+		stEnc, err := s.aes.Encrypt([]byte(st))
+		if err != nil {
+			skipped++
+			continue
+		}
+
+		// access_token、refresh_token、session_token 都使用同一个 session token
+		// 这样后续测试时可以直接用 session token 进行认证
+		atEnc := stEnc
+		rtEnc := stEnc
+
+		// credential_enc 使用 session token
+		credEnc := stEnc
+
+		a := &model.Account{
+			Provider:         provider,
+			Name:             name,
+			AuthType:         model.AuthTypeOAuth,
+			CredentialEnc:    credEnc,
+			RefreshTokenEnc:  rtEnc,
+			AccessTokenEnc:   atEnc,
+			SessionTokenEnc:  stEnc,
+			Weight:           weight,
+			Status:           model.AccountStatusEnabled,
+			CreatedBy:        &adminID,
+		}
+
+		// 设置 access_token 过期时间为当前时间（标记为需要刷新）
+		now := time.Now().UTC()
+		a.AccessTokenExpiresAt = &now
+
+		if req.ProxyID != nil && *req.ProxyID > 0 {
+			pid := *req.ProxyID
+			a.ProxyID = &pid
+		}
+
+		// 设置 OAuth meta，标记来源为 session_token 导入
+		meta := map[string]any{
+			"source":        "session_token_import",
+			"imported_at":   time.Now().UTC().Format(time.RFC3339),
+			"needs_refresh": true,
+		}
+		if mb, err := json.Marshal(meta); err == nil {
+			ms := string(mb)
+			a.OAuthMeta = &ms
+		}
+
+		items = append(items, a)
+	}
+
+	if len(items) == 0 {
+		return &dto.BatchImportResult{Imported: 0, Skipped: skipped}, nil
+	}
+
+	if err := s.repo.BatchCreate(ctx, items); err != nil {
+		return nil, errcode.DBError.Wrap(err)
+	}
+
+	s.pool.Reload(provider)
+
+	return &dto.BatchImportResult{
+		Imported: len(items),
+		Skipped:  skipped,
+	}, nil
+}
+
+// randomTokenSuffix 生成随机后缀用于占位 token
+func randomTokenSuffix() string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 8)
+	for i := range b {
+		b[i] = charset[i%len(charset)]
+	}
+	return string(b)
 }
 
 func accountClientIDFromImport(c *dto.Sub2APICreds) string {

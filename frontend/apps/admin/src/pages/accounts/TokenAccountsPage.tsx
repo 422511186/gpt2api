@@ -884,7 +884,7 @@ function CreateDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 }
 
 function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
-  const [importMode, setImportMode] = useState<'lines' | 'sub2api'>('lines');
+  const [importMode, setImportMode] = useState<'lines' | 'sub2api' | 'session_tokens'>('lines');
   const [body, setBody] = useState<AccountBatchImportBody>({
     provider: 'gpt',
     auth_type: 'oauth',
@@ -988,6 +988,9 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
           <button type="button" className={`btn btn-sm ${importMode === 'sub2api' ? 'btn-primary' : 'btn-outline'}`} onClick={() => setImportMode('sub2api')}>
             JSON 导入
           </button>
+          <button type="button" className={`btn btn-sm ${importMode === 'session_tokens' ? 'btn-primary' : 'btn-outline'}`} onClick={() => setImportMode('session_tokens')}>
+            Session Token 导入
+          </button>
         </div>
 
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -1004,13 +1007,15 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
               <option value="grok">GROK</option>
             </select>
           </Field>
-          <Field label="认证类型">
-            <select className="select select-sm" value={body.auth_type} onChange={(e) => setBody((prev) => ({ ...prev, auth_type: e.target.value as AuthType }))}>
-              <option value="api_key">API Key</option>
-              <option value="oauth">OAuth</option>
-              <option value="cookie">Grok Token</option>
-            </select>
-          </Field>
+          {importMode !== 'session_tokens' && (
+            <Field label="认证类型">
+              <select className="select select-sm" value={body.auth_type} onChange={(e) => setBody((prev) => ({ ...prev, auth_type: e.target.value as AuthType }))}>
+                <option value="api_key">API Key</option>
+                <option value="oauth">OAuth</option>
+                <option value="cookie">Grok Token</option>
+              </select>
+            </Field>
+          )}
           <Field label="默认代理">
             <select
               className="select select-sm"
@@ -1061,6 +1066,45 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
               <textarea
                 className="textarea min-h-[180px] font-mono text-small"
                 placeholder={linePlaceholder}
+                value={body.text || ''}
+                onChange={(e) => setBody((prev) => ({ ...prev, text: e.target.value }))}
+              />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <button type="button" className="btn btn-outline btn-md" onClick={onClose}>
+                取消
+              </button>
+              <button type="submit" className="btn btn-primary btn-md" disabled={importLines.isPending}>
+                {importLines.isPending ? '导入中…' : '开始导入'}
+              </button>
+            </div>
+          </form>
+        ) : importMode === 'session_tokens' ? (
+          <form
+            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!body.text?.trim()) {
+                toast.error('请粘贴 Session Token 列表');
+                return;
+              }
+              importLines.mutate({
+                format: 'session_tokens',
+                provider: body.provider,
+                base_url: normalizeBaseURL(body.base_url),
+                proxy_id: body.proxy_id && body.proxy_id > 0 ? body.proxy_id : undefined,
+                weight: body.weight || 10,
+                text: body.text,
+              });
+            }}
+          >
+            <div className="card card-flat p-3 text-small text-text-secondary">
+              Session Token 导入模式：每行一个 session_token，系统会自动填充占位的 access_token 和 refresh_token。导入后需手动刷新 OAuth 获取有效的 access_token。
+            </div>
+            <Field label="每行一个 Session Token">
+              <textarea
+                className="textarea min-h-[180px] font-mono text-small"
+                placeholder="每行一个 session_token..."
                 value={body.text || ''}
                 onChange={(e) => setBody((prev) => ({ ...prev, text: e.target.value }))}
               />
