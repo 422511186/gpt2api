@@ -54,16 +54,17 @@ type AccountUpdateReq struct {
 // 当 auth_type=oauth 时，每行的 credential 实际为 OpenAI Codex CLI 的 refresh_token。
 //
 // format=sub2api：兼容 sub2api / Codex 等导出的 JSON（顶层含 accounts[]）。
+// format=session_tokens：每行一个 session token，自动填充占位的 access_token 和 refresh_token。
 // 单次请求 accounts 建议 ≤500 条，大块导入请前端分批 POST。
 type AccountBatchImportReq struct {
-	Format   string `json:"format"    binding:"omitempty,oneof=lines sub2api"`
+	Format   string `json:"format"    binding:"omitempty,oneof=lines sub2api session_tokens"`
 	Provider string `json:"provider"  binding:"required,oneof=gpt grok"`
-	// lines 模式必填；sub2api 可省略（由每条 account.type / platform 推导）
+	// lines 模式必填；sub2api / session_tokens 可省略（由每条 account.type / platform 推导）
 	AuthType string  `json:"auth_type" binding:"omitempty,oneof=api_key cookie oauth"`
 	BaseURL  string  `json:"base_url"  binding:"omitempty,url"`
 	ProxyID  *uint64 `json:"proxy_id" binding:"omitempty"`
 	Weight   int     `json:"weight"    binding:"omitempty,min=1,max=1000"`
-	// lines 模式：多行文本
+	// lines / session_tokens 模式：多行文本
 	Text string `json:"text"`
 	// sub2api 模式：解析后的账号切片
 	Accounts []Sub2APIAccountItem `json:"accounts"`
