@@ -40,6 +40,8 @@ import type {
   ProxyTestResp,
   ProxyUpdateBody,
   SystemSettings,
+  RegisterConfig,
+  RegisterConfigReq,
 } from './types';
 
 export const authApi = {
@@ -255,4 +257,15 @@ export const systemApi = {
       method: 'DELETE',
       data: body,
     }),
+};
+
+// ==================== 注册机 ====================
+
+export const registerApi = {
+  get: () => request<{ register: RegisterConfig }>({ url: '/register', method: 'GET' }),
+  update: (body: RegisterConfigReq) =>
+    request<{ register: RegisterConfig }>({ url: '/register', method: 'POST', data: body }),
+  start: () => request<{ register: RegisterConfig }>({ url: '/register/start', method: 'POST' }),
+  stop: () => request<{ register: RegisterConfig }>({ url: '/register/stop', method: 'POST' }),
+  reset: () => request<{ register: RegisterConfig }>({ url: '/register/reset', method: 'POST' }),
 };

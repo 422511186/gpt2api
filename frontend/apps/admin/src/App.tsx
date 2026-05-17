@@ -17,6 +17,7 @@ const BillingSettingsPage = lazy(() => import('./pages/system/BillingSettingsPag
 const RechargePackagesPage = lazy(() => import('./pages/system/RechargePackagesPage'));
 const ModelPricesPage = lazy(() => import('./pages/system/ModelPricesPage'));
 const LogsPage = lazy(() => import('./pages/logs/LogsPage'));
+const RegisterPage = lazy(() => import('./pages/register/RegisterPage'));
 
 export default function App() {
   return (
@@ -39,6 +40,7 @@ export default function App() {
               <Route path="/recharge-packages" element={<RechargePackagesPage />} />
               <Route path="/model-prices" element={<ModelPricesPage />} />
               <Route path="/logs"       element={<LogsPage />} />
+              <Route path="/register"   element={<RegisterPage />} />
             </Route>
           </Route>
         </Routes>

@@ -527,3 +527,84 @@ export interface SystemSettings {
   'oauth.openai_token_url'?: string;
   [key: string]: unknown;
 }
+
+// ==================== 注册机 ====================
+
+export interface MailProviderConfig {
+  type: string;
+  enable: boolean;
+  api_base?: string;
+  api_key?: string;
+  admin_password?: string;
+  domain?: string[];
+  default_domain?: string;
+  subdomain?: string;
+  wildcard?: boolean;
+  random_subdomain?: boolean;
+  ddg_token?: string;
+  cf_inbox_jwt?: string;
+  cf_api_base?: string;
+  cf_api_key?: string;
+  cf_auth_mode?: string;
+  cf_domain?: string[];
+  cf_create_path?: string;
+  cf_messages_path?: string;
+  expiry_time?: number;
+}
+
+export interface MailConfig {
+  request_timeout: number;
+  wait_timeout: number;
+  wait_interval: number;
+  user_agent?: string;
+  proxy?: string;
+  providers: MailProviderConfig[];
+}
+
+export interface RegisterStats {
+  job_id?: string;
+  success: number;
+  fail: number;
+  done: number;
+  running: number;
+  threads: number;
+  elapsed_seconds: number;
+  avg_seconds: number;
+  success_rate: number;
+  current_quota: number;
+  current_available: number;
+  started_at?: string;
+  updated_at?: string;
+  finished_at?: string;
+}
+
+export interface RegisterLog {
+  time: string;
+  text: string;
+  level: 'info' | 'green' | 'red' | 'yellow';
+}
+
+export interface RegisterConfig {
+  mail: MailConfig;
+  proxy: string;
+  total: number;
+  threads: number;
+  mode: 'total' | 'quota' | 'available';
+  target_quota: number;
+  target_available: number;
+  check_interval: number;
+  enabled: boolean;
+  stats: RegisterStats;
+  logs: RegisterLog[];
+}
+
+export interface RegisterConfigReq {
+  mail?: MailConfig;
+  proxy?: string;
+  total?: number;
+  threads?: number;
+  mode?: 'total' | 'quota' | 'available';
+  target_quota?: number;
+  target_available?: number;
+  check_interval?: number;
+}

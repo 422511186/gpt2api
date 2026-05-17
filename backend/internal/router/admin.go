@@ -11,6 +11,7 @@ import (
 	"github.com/kleinai/backend/internal/middleware"
 	"github.com/kleinai/backend/internal/repo"
 	"github.com/kleinai/backend/internal/service"
+	"github.com/kleinai/backend/internal/service/register"
 	"github.com/kleinai/backend/pkg/jwtx"
 )
 
@@ -70,6 +71,10 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 	sysH := handler.NewAdminSystemHandler(sysCfgSvc)
 	logH := handler.NewAdminLogHandler(generationRepo, accountRepo, deps.AES)
 	dashboardH := handler.NewAdminDashboardHandler(dashboardRepo)
+
+	// === register service ===
+	registerSvc := register.NewRegisterService(accountRepo, deps.AES, pool)
+	registerH := handler.NewRegisterHandler(registerSvc)
 
 	// auth 公开
 	auth := v1.Group("/auth")
@@ -158,6 +163,17 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 			logs.GET("/generations", logH.GenerationLogs)
 			logs.GET("/generations/:task_id/upstream", logH.GenerationUpstreamLogs)
 			logs.DELETE("/generations", logH.PurgeGenerationLogs)
+		}
+
+		// 注册机管理
+		reg := authed.Group("/register")
+		{
+			reg.GET("", registerH.GetConfig)
+			reg.POST("", registerH.UpdateConfig)
+			reg.POST("/start", registerH.Start)
+			reg.POST("/stop", registerH.Stop)
+			reg.POST("/reset", registerH.Reset)
+			reg.GET("/events", registerH.Events)
 		}
 	}
 

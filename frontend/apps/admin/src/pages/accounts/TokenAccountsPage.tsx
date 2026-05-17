@@ -1099,8 +1099,7 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
             }}
           >
             <div className="card card-flat p-3 text-small text-text-secondary">
-              Session Token 导入模式：每行一个 session_token，系统会自动填充占位的 access_token 和 refresh_token。
-              导入后需要手动刷新 OAuth 来获取有效的 access_token。
+              Session Token 导入模式：每行一个 session_token，系统会自动填充占位的 access_token 和 refresh_token。导入后需手动刷新 OAuth 获取有效的 access_token。
             </div>
             <Field label="每行一个 Session Token">
               <textarea

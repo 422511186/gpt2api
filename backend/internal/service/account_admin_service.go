@@ -652,36 +652,24 @@ func (s *AccountAdminService) batchImportSessionTokens(ctx context.Context, admi
 			continue
 		}
 
-		// session token 作为主要凭证
+		// session token 作为主要凭证，同时填入 AT/RT 以便后续直接使用
 		st := line
 		name := fmt.Sprintf("session-%d-%s", i+1, shortTokenName(st))
 
-		// 加密 session token
+		// 加密 session token（用于 AT/RT/ST 三个字段）
 		stEnc, err := s.aes.Encrypt([]byte(st))
 		if err != nil {
 			skipped++
 			continue
 		}
 
-		// 创建占位的 access_token 和 refresh_token
-		// 使用随机字符串作为占位，后续刷新时会获取真实的 token
-		placeholderAT := fmt.Sprintf("placeholder_at_%d_%s", i+1, randomTokenSuffix())
-		placeholderRT := fmt.Sprintf("placeholder_rt_%d_%s", i+1, randomTokenSuffix())
+		// access_token、refresh_token、session_token 都使用同一个 session token
+		// 这样后续测试时可以直接用 session token 进行认证
+		atEnc := stEnc
+		rtEnc := stEnc
 
-		atEnc, err := s.aes.Encrypt([]byte(placeholderAT))
-		if err != nil {
-			skipped++
-			continue
-		}
-
-		rtEnc, err := s.aes.Encrypt([]byte(placeholderRT))
-		if err != nil {
-			skipped++
-			continue
-		}
-
-		// credential_enc 使用占位的 refresh_token
-		credEnc := rtEnc
+		// credential_enc 使用 session token
+		credEnc := stEnc
 
 		a := &model.Account{
 			Provider:         provider,
