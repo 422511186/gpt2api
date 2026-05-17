@@ -684,9 +684,9 @@ func (s *AccountAdminService) batchImportSessionTokens(ctx context.Context, admi
 			CreatedBy:        &adminID,
 		}
 
-		// 设置 access_token 过期时间为当前时间（标记为需要刷新）
-		now := time.Now().UTC()
-		a.AccessTokenExpiresAt = &now
+			// 设置 access_token 过期时间为 30 天后（session token 可直接使用）
+			expireAt := time.Now().Add(30 * 24 * time.Hour).UTC()
+			a.AccessTokenExpiresAt = &expireAt
 
 		if req.ProxyID != nil && *req.ProxyID > 0 {
 			pid := *req.ProxyID
