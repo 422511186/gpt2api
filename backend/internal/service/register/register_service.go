@@ -136,8 +136,20 @@ func NewRegisterService(
 
 // GetConfig returns the current configuration
 func (s *RegisterService) GetConfig() RegisterConfig {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Compute stats before returning (so frontend gets fresh values)
+	if s.config.Enabled && !s.startTime.IsZero() {
+		elapsed := time.Since(s.startTime).Seconds()
+		s.config.Stats.ElapsedSeconds = elapsed
+
+		if s.config.Stats.Done > 0 {
+			s.config.Stats.AvgSeconds = elapsed / float64(s.config.Stats.Done)
+			s.config.Stats.SuccessRate = float64(s.config.Stats.Success) / float64(s.config.Stats.Done) * 100
+		}
+	}
+
 	return s.config
 }
 
@@ -475,6 +487,7 @@ func (s *RegisterService) recordSuccess(result *RegistrationResult, index int) {
 
 	s.config.Stats.Success++
 	s.config.Stats.Done++
+	s.updateStatsLocked()
 	s.appendLogLocked(fmt.Sprintf("%s 注册成功", result.Email), "green")
 
 	// Save to account pool
@@ -491,9 +504,28 @@ func (s *RegisterService) recordFailure(err error, index int) {
 
 	s.config.Stats.Fail++
 	s.config.Stats.Done++
+	s.updateStatsLocked()
 	s.appendLogLocked(fmt.Sprintf("任务%d 注册失败: %v", index, err), "red")
 
 	s.notifySubscribers()
+}
+
+func (s *RegisterService) updateStatsLocked() {
+	// Compute elapsed time since start
+	if !s.startTime.IsZero() {
+		elapsed := time.Since(s.startTime).Seconds()
+		s.config.Stats.ElapsedSeconds = elapsed
+	}
+
+	// Compute average time per registration
+	if s.config.Stats.Done > 0 {
+		s.config.Stats.AvgSeconds = s.config.Stats.ElapsedSeconds / float64(s.config.Stats.Done)
+	}
+
+	// Compute success rate
+	if s.config.Stats.Done > 0 {
+		s.config.Stats.SuccessRate = float64(s.config.Stats.Success) / float64(s.config.Stats.Done) * 100
+	}
 }
 
 func (s *RegisterService) finish() {

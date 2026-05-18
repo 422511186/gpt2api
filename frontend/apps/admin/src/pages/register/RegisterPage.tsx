@@ -562,6 +562,42 @@ function Field({ label, hint, className, children }: { label: string; hint?: Rea
 }
 
 function NumberField({ label, value, min = 0, max, onChange, disabled }: { label: string; value: number; min?: number; max?: number; onChange: (v: number) => void; disabled?: boolean }) {
+  // Use a local state to allow clearing the input during editing
+  const [localValue, setLocalValue] = useState<string>(String(value));
+
+  // Sync local value when external value changes
+  useEffect(() => {
+    setLocalValue(String(value));
+  }, [value]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    setLocalValue(raw);
+
+    // Only call onChange when the value is a valid number
+    if (raw === '') {
+      // Allow empty input during editing, don't call onChange yet
+      return;
+    }
+    const num = Number(raw);
+    if (!isNaN(num)) {
+      const clamped = max !== undefined ? Math.min(max, Math.max(min, num)) : Math.max(min, num);
+      onChange(clamped);
+    }
+  };
+
+  const handleBlur = () => {
+    // On blur, if empty or invalid, reset to min value
+    const num = Number(localValue);
+    if (localValue === '' || isNaN(num) || num < min) {
+      setLocalValue(String(min));
+      onChange(min);
+    } else if (max !== undefined && num > max) {
+      setLocalValue(String(max));
+      onChange(max);
+    }
+  };
+
   return (
     <Field label={label}>
       <input
@@ -569,8 +605,9 @@ function NumberField({ label, value, min = 0, max, onChange, disabled }: { label
         className="input"
         min={min}
         max={max}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value) || min)}
+        value={localValue}
+        onChange={handleChange}
+        onBlur={handleBlur}
         disabled={disabled}
       />
     </Field>
