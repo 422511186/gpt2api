@@ -1099,6 +1099,7 @@ func accountToResp(a *model.Account, _ *crypto.AESGCM) *dto.AccountResp {
 		SuccessCount:      a.SuccessCount,
 		HasRefreshToken:   len(a.RefreshTokenEnc) > 0,
 		HasAccessToken:    len(a.AccessTokenEnc) > 0,
+		HasSessionToken:  len(a.SessionTokenEnc) > 0,
 		LastTestStatus:    a.LastTestStatus,
 		LastTestLatencyMs: a.LastTestLatencyMs,
 		CreatedAt:         a.CreatedAt.Unix(),

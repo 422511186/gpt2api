@@ -176,6 +176,7 @@ type AccountResp struct {
 	Remark              string `json:"remark,omitempty"`
 	HasRefreshToken     bool   `json:"has_refresh_token"`
 	HasAccessToken      bool   `json:"has_access_token"`
+	HasSessionToken     bool   `json:"has_session_token"`
 	AccessTokenExpireAt int64  `json:"access_token_expire_at,omitempty"`
 	LastRefreshAt       int64  `json:"last_refresh_at,omitempty"`
 	LastTestAt          int64  `json:"last_test_at,omitempty"`

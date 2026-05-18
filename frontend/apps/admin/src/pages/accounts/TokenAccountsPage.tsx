@@ -508,6 +508,9 @@ export default function TokenAccountsPage() {
                           <span className={`badge text-tiny ${item.has_access_token ? 'badge-success' : needsAttention ? 'badge-warning' : 'badge-outline'}`}>
                             AT {item.has_access_token ? '已取到' : '缺失'}
                           </span>
+                          <span className={`badge text-tiny ${item.has_session_token ? 'badge-success' : 'badge-outline'}`}>
+                            ST {item.has_session_token ? '已存' : '未设'}
+                          </span>
                         </div>
                         <div className={`inline-flex flex-wrap items-center gap-1 ${check.cls}`}>
                           <CheckIcon size={12} />

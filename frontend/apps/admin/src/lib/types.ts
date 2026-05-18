@@ -253,6 +253,7 @@ export interface AccountItem {
   /** OAuth 状态 */
   has_refresh_token?: boolean;
   has_access_token?: boolean;
+  has_session_token?: boolean;
   access_token_expire_at?: number;
   last_refresh_at?: number;
   /** 最近一次连通性测试 */
