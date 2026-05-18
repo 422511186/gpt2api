@@ -587,6 +587,7 @@ export interface RegisterLog {
 export interface RegisterConfig {
   mail: MailConfig;
   proxy: string;
+  flaresolverr_url: string;
   total: number;
   threads: number;
   mode: 'total' | 'quota' | 'available';
@@ -601,6 +602,7 @@ export interface RegisterConfig {
 export interface RegisterConfigReq {
   mail?: MailConfig;
   proxy?: string;
+  flaresolverr_url?: string;
   total?: number;
   threads?: number;
   mode?: 'total' | 'quota' | 'available';

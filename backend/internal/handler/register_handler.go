@@ -73,6 +73,7 @@ func (h *RegisterHandler) UpdateConfig(c *gin.Context) {
 	}
 
 	updates.Proxy = req.Proxy
+	updates.FlareSolverrURL = req.FlareSolverrURL
 	updates.Total = req.Total
 	updates.Threads = req.Threads
 	if req.Mode != "" {

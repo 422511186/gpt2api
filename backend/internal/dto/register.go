@@ -4,6 +4,7 @@ package dto
 type RegisterConfigReq struct {
 	Mail            *MailConfigReq           `json:"mail,omitempty"`
 	Proxy           string                   `json:"proxy,omitempty"`
+	FlareSolverrURL string                   `json:"flaresolverr_url,omitempty"`
 	Total           int                      `json:"total,omitempty"`
 	Threads         int                      `json:"threads,omitempty"`
 	Mode            string                   `json:"mode,omitempty"`

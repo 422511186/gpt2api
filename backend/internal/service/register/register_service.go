@@ -52,6 +52,7 @@ type RegisterLog struct {
 type RegisterConfig struct {
 	Mail            MailConfig    `json:"mail"`
 	Proxy           string        `json:"proxy"`
+	FlareSolverrURL string        `json:"flaresolverr_url"`
 	Total           int           `json:"total"`
 	Threads         int           `json:"threads"`
 	Mode            RegisterMode  `json:"mode"`
@@ -86,6 +87,7 @@ type RegisterService struct {
 	mu          sync.RWMutex
 	config      RegisterConfig
 	accountRepo *repo.AccountRepo
+	sysCfgRepo  *repo.SystemConfigRepo
 	aes         *crypto.AESGCM
 	pool        AccountPoolReloader
 	cancel      context.CancelFunc
@@ -101,19 +103,35 @@ type AccountPoolReloader interface {
 	Reload(provider string)
 }
 
+const registerConfigKey = "register_config"
+
 // NewRegisterService creates a new register service
 func NewRegisterService(
 	accountRepo *repo.AccountRepo,
+	sysCfgRepo *repo.SystemConfigRepo,
 	aes *crypto.AESGCM,
 	pool AccountPoolReloader,
 ) *RegisterService {
-	return &RegisterService{
+	s := &RegisterService{
 		accountRepo: accountRepo,
+		sysCfgRepo:  sysCfgRepo,
 		aes:         aes,
 		pool:        pool,
 		config:      DefaultRegisterConfig(),
 		subscribers: make(map[chan RegisterConfig]struct{}),
 	}
+
+	// Load config from database if exists
+	if sysCfgRepo != nil {
+		cfgModel, err := sysCfgRepo.GetByKey(context.Background(), registerConfigKey)
+		if err == nil && cfgModel != nil && cfgModel.Value != "" {
+			if err := s.LoadConfig([]byte(cfgModel.Value)); err == nil {
+				// Config loaded successfully
+			}
+		}
+	}
+
+	return s
 }
 
 // GetConfig returns the current configuration
@@ -121,6 +139,18 @@ func (s *RegisterService) GetConfig() RegisterConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.config
+}
+
+// saveConfig persists config to database
+func (s *RegisterService) saveConfig() error {
+	if s.sysCfgRepo == nil {
+		return nil
+	}
+	data, err := json.Marshal(s.config)
+	if err != nil {
+		return err
+	}
+	return s.sysCfgRepo.Upsert(context.Background(), registerConfigKey, string(data), nil, nil)
 }
 
 // UpdateConfig updates the configuration
@@ -150,6 +180,9 @@ func (s *RegisterService) UpdateConfig(updates RegisterConfig) RegisterConfig {
 	if updates.Proxy != "" {
 		s.config.Proxy = updates.Proxy
 	}
+	if updates.FlareSolverrURL != "" {
+		s.config.FlareSolverrURL = updates.FlareSolverrURL
+	}
 	if updates.Total > 0 {
 		s.config.Total = updates.Total
 	}
@@ -169,6 +202,9 @@ func (s *RegisterService) UpdateConfig(updates RegisterConfig) RegisterConfig {
 	if updates.CheckInterval > 0 {
 		s.config.CheckInterval = updates.CheckInterval
 	}
+
+	// Persist to database
+	s.saveConfig()
 
 	return s.config
 }
@@ -295,8 +331,10 @@ func (s *RegisterService) notifySubscribers() {
 	s.subscribersMu.RLock()
 	defer s.subscribersMu.RUnlock()
 
-	cfg := s.GetConfig()
+	cfg := s.config
 	for ch := range s.subscribers {
+		// Non-blocking send: if channel is full, skip this push.
+		// Subscriber will get the next one.
 		select {
 		case ch <- cfg:
 		default:
@@ -360,7 +398,7 @@ func (s *RegisterService) run(ctx context.Context) {
 }
 
 func (s *RegisterService) registerOne(ctx context.Context, index int) (*RegistrationResult, error) {
-	registrar := NewPlatformRegistrar(s.config.Proxy, &s.config.Mail)
+	registrar := NewPlatformRegistrar(s.config.Proxy, s.config.FlareSolverrURL, &s.config.Mail)
 	defer registrar.Close()
 
 	log := func(text, level string) {
@@ -398,11 +436,27 @@ func (s *RegisterService) targetReached(ctx context.Context, submitted int) bool
 }
 
 func (s *RegisterService) getPoolMetrics() map[string]int {
-	// This is a simplified implementation
-	// In a real implementation, you would query the database
+	ctx := context.Background()
+	accounts, err := s.accountRepo.AvailableByProvider(ctx, model.ProviderGPT)
+	if err != nil {
+		return map[string]int{"quota": 0, "available": 0}
+	}
+
+	totalQuota := 0
+	for _, a := range accounts {
+		if a.OAuthMeta != nil {
+			var meta struct {
+				ImageQuotaRemaining int `json:"image_quota_remaining"`
+			}
+			if json.Unmarshal([]byte(*a.OAuthMeta), &meta) == nil {
+				totalQuota += meta.ImageQuotaRemaining
+			}
+		}
+	}
+
 	return map[string]int{
-		"quota":    0,
-		"available": 0,
+		"quota":    totalQuota,
+		"available": len(accounts),
 	}
 }
 
@@ -413,21 +467,6 @@ func (s *RegisterService) updateMetrics(metrics map[string]int) {
 	s.config.Stats.CurrentQuota = metrics["quota"]
 	s.config.Stats.CurrentAvailable = metrics["available"]
 	s.config.Stats.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-
-	// Update elapsed time
-	if !s.startTime.IsZero() {
-		elapsed := time.Since(s.startTime).Seconds()
-		s.config.Stats.ElapsedSeconds = elapsed
-
-		if s.config.Stats.Success > 0 {
-			s.config.Stats.AvgSeconds = elapsed / float64(s.config.Stats.Success)
-		}
-
-		total := s.config.Stats.Success + s.config.Stats.Fail
-		if total > 0 {
-			s.config.Stats.SuccessRate = float64(s.config.Stats.Success) * 100 / float64(total)
-		}
-	}
 }
 
 func (s *RegisterService) recordSuccess(result *RegistrationResult, index int) {
@@ -505,7 +544,11 @@ func (s *RegisterService) saveToAccountPool(result *RegistrationResult) error {
 	metaStr := string(metaBytes)
 
 	// Set access token expiration
-	now := time.Now().UTC()
+	expiresIn := result.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600 // default 1 hour
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
 
 	account := &model.Account{
 		Provider:           model.ProviderGPT,
@@ -516,7 +559,7 @@ func (s *RegisterService) saveToAccountPool(result *RegistrationResult) error {
 		AccessTokenEnc:     atEnc,
 		SessionTokenEnc:    stEnc,
 		OAuthMeta:          &metaStr,
-		AccessTokenExpiresAt: &now,
+		AccessTokenExpiresAt: &expiresAt,
 		Status:             model.AccountStatusEnabled,
 		Weight:             10,
 	}
@@ -539,16 +582,16 @@ func (s *RegisterService) appendLog(text, level string) {
 
 func (s *RegisterService) appendLogLocked(text, level string) {
 	log := RegisterLog{
-		Time:  time.Now().UTC().Format(time.RFC3339),
+		Time:  time.Now().Format(time.RFC3339),
 		Text:  text,
 		Level: level,
 	}
 
 	s.config.Logs = append(s.config.Logs, log)
 
-	// Keep only last 300 logs
-	if len(s.config.Logs) > 300 {
-		s.config.Logs = s.config.Logs[len(s.config.Logs)-300:]
+	// Keep only last 80 logs (limit SSE payload size)
+	if len(s.config.Logs) > 80 {
+		s.config.Logs = s.config.Logs[len(s.config.Logs)-80:]
 	}
 
 	s.notifySubscribers()

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -22,7 +23,8 @@ const (
 // TempMailLolProvider implements MailProvider for tempmail.lol
 type TempMailLolProvider struct {
 	base    BaseMailProvider
-	apiKey  string
+	apiKeys []string
+	keyIdx  atomic.Int64
 	domain  []string
 	client  *resty.Client
 }
@@ -31,8 +33,15 @@ type TempMailLolProvider struct {
 func NewTempMailLolProvider(cfg MailProviderConfig, mailCfg MailConfig) *TempMailLolProvider {
 	p := &TempMailLolProvider{
 		base:   BaseMailProvider{conf: mailCfg},
-		apiKey: cfg.APIKey,
 		domain: cfg.Domain,
+	}
+
+	// Split API keys by newline, filter empty
+	for _, k := range strings.Split(cfg.APIKey, "\n") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			p.apiKeys = append(p.apiKeys, k)
+		}
 	}
 
 	p.client = resty.New().
@@ -40,10 +49,6 @@ func NewTempMailLolProvider(cfg MailProviderConfig, mailCfg MailConfig) *TempMai
 		SetHeader("User-Agent", mailCfg.UserAgent).
 		SetHeader("Accept", "application/json").
 		SetHeader("Content-Type", "application/json")
-
-	if p.apiKey != "" {
-		p.client.SetAuthToken(p.apiKey)
-	}
 
 	// Configure proxy if set
 	if mailCfg.Proxy != "" {
@@ -58,6 +63,25 @@ func NewTempMailLolProvider(cfg MailProviderConfig, mailCfg MailConfig) *TempMai
 
 func (p *TempMailLolProvider) Name() string {
 	return "tempmail_lol"
+}
+
+// nextKey returns the next API key in round-robin order.
+// Returns empty string if no keys configured.
+func (p *TempMailLolProvider) nextKey() string {
+	if len(p.apiKeys) == 0 {
+		return ""
+	}
+	idx := p.keyIdx.Add(1) - 1
+	return p.apiKeys[idx%int64(len(p.apiKeys))]
+}
+
+// req creates a resty request with the next rotated API key.
+func (p *TempMailLolProvider) req(ctx context.Context) *resty.Request {
+	r := p.client.R().SetContext(ctx)
+	if key := p.nextKey(); key != "" {
+		r.SetAuthToken(key)
+	}
+	return r
 }
 
 func (p *TempMailLolProvider) CreateMailbox(ctx context.Context, username string) (*Mailbox, error) {
@@ -75,8 +99,7 @@ func (p *TempMailLolProvider) CreateMailbox(ctx context.Context, username string
 		payload["prefix"] = username
 	}
 
-	resp, err := p.client.R().
-		SetContext(ctx).
+	resp, err := p.req(ctx).
 		SetBody(payload).
 		Post(tempMailAPIBase + "/inbox/create")
 
@@ -110,8 +133,7 @@ func (p *TempMailLolProvider) CreateMailbox(ctx context.Context, username string
 }
 
 func (p *TempMailLolProvider) FetchLatestMessage(ctx context.Context, mailbox *Mailbox) (*Message, error) {
-	resp, err := p.client.R().
-		SetContext(ctx).
+	resp, err := p.req(ctx).
 		SetQueryParam("token", mailbox.Token).
 		Get(tempMailAPIBase + "/inbox")
 
@@ -123,31 +145,22 @@ func (p *TempMailLolProvider) FetchLatestMessage(ctx context.Context, mailbox *M
 		return nil, fmt.Errorf("fetch messages failed: HTTP %d", resp.StatusCode())
 	}
 
+	type emailItem struct {
+		ID        string `json:"id"`
+		Subject   string `json:"subject"`
+		From      string `json:"from"`
+		FromAddr  string `json:"from_address"`
+		Body      string `json:"body"`
+		HTML      string `json:"html"`
+		Text      string `json:"text"`
+		CreatedAt int64  `json:"created_at"`
+		Date      any    `json:"date"`
+		Timestamp int64  `json:"timestamp"`
+	}
+
 	var data struct {
-		Emails []struct {
-			ID        string `json:"id"`
-			Subject   string `json:"subject"`
-			From      string `json:"from"`
-			FromAddr  string `json:"from_address"`
-			Body      string `json:"body"`
-			HTML      string `json:"html"`
-			Text      string `json:"text"`
-			CreatedAt int64  `json:"created_at"`
-			Date      string `json:"date"`
-			Timestamp int64  `json:"timestamp"`
-		} `json:"emails"`
-		Messages []struct {
-			ID        string `json:"id"`
-			Subject   string `json:"subject"`
-			From      string `json:"from"`
-			FromAddr  string `json:"from_address"`
-			Body      string `json:"body"`
-			HTML      string `json:"html"`
-			Text      string `json:"text"`
-			CreatedAt int64  `json:"created_at"`
-			Date      string `json:"date"`
-			Timestamp int64  `json:"timestamp"`
-		} `json:"messages"`
+		Emails   []emailItem `json:"emails"`
+		Messages []emailItem `json:"messages"`
 	}
 
 	if err := json.Unmarshal(resp.Body(), &data); err != nil {
@@ -160,53 +173,35 @@ func (p *TempMailLolProvider) FetchLatestMessage(ctx context.Context, mailbox *M
 		return nil, nil
 	}
 
-	// Find the most recent message
-	var latest *struct {
-		ID        string `json:"id"`
-		Subject   string `json:"subject"`
-		From      string `json:"from"`
-		FromAddr  string `json:"from_address"`
-		Body      string `json:"body"`
-		HTML      string `json:"html"`
-		Text      string `json:"text"`
-		CreatedAt int64  `json:"created_at"`
-		Date      string `json:"date"`
-		Timestamp int64  `json:"timestamp"`
-	}
+	// Return the LAST message (most recent by list order)
+	// The API likely returns messages in chronological order
+	item := &items[len(items)-1]
 
-	var latestTime time.Time
-	for i := range items {
-		item := &items[i]
-		var t time.Time
-		if item.CreatedAt > 0 {
-			t = time.Unix(item.CreatedAt, 0)
-		} else if item.Timestamp > 0 {
-			t = time.Unix(item.Timestamp, 0)
-		}
-		if t.After(latestTime) {
-			latestTime = t
-			latest = item
-		}
-	}
-
-	if latest == nil {
-		latest = &items[0]
-	}
-
-	textContent := latest.Text
+	textContent := item.Text
 	if textContent == "" {
-		textContent = latest.Body
+		textContent = item.Body
+	}
+
+	// Parse timestamp - prefer created_at, then timestamp, then use current time as fallback
+	var receivedAt time.Time
+	if item.CreatedAt > 0 {
+		receivedAt = time.Unix(item.CreatedAt, 0)
+	} else if item.Timestamp > 0 {
+		receivedAt = time.Unix(item.Timestamp, 0)
+	} else {
+		// If no timestamp, use current time as the message just arrived
+		receivedAt = time.Now()
 	}
 
 	return &Message{
 		Provider:    p.Name(),
 		Mailbox:     mailbox.Address,
-		MessageID:   latest.ID,
-		Subject:     latest.Subject,
-		Sender:      latest.FromAddr,
+		MessageID:   item.ID,
+		Subject:     item.Subject,
+		Sender:      item.FromAddr,
 		TextContent: textContent,
-		HTMLContent: latest.HTML,
-		ReceivedAt:  &latestTime,
+		HTMLContent: item.HTML,
+		ReceivedAt:  &receivedAt,
 	}, nil
 }
 

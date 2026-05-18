@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -44,18 +43,19 @@ type RegistrationResult struct {
 	RefreshToken string `json:"refresh_token"`
 	IDToken      string `json:"id_token"`
 	SessionToken string `json:"session_token,omitempty"`
+	ExpiresIn    int    `json:"expires_in"`
 	CreatedAt    string `json:"created_at"`
 }
 
 // PlatformRegistrar handles the OpenAI registration flow
 type PlatformRegistrar struct {
-	client    *http.Client
-	utlsConn  *utls.UConn
-	deviceID  string
-	proxyURL  string
-	mailCfg   *MailConfig
-	userAgent string
-	secCHUA   string
+	client          *http.Client
+	deviceID        string
+	proxyURL        string
+	flareSolverrURL string
+	mailCfg         *MailConfig
+	userAgent       string
+	secCHUA         string
 
 	// PKCE parameters
 	codeVerifier  string
@@ -66,7 +66,7 @@ type PlatformRegistrar struct {
 }
 
 // NewPlatformRegistrar creates a new registrar
-func NewPlatformRegistrar(proxyURL string, mailCfg *MailConfig) *PlatformRegistrar {
+func NewPlatformRegistrar(proxyURL string, flareSolverrURL string, mailCfg *MailConfig) *PlatformRegistrar {
 	userAgent := defaultUserAgent
 	secCHUA := defaultSecCHUA
 
@@ -76,6 +76,7 @@ func NewPlatformRegistrar(proxyURL string, mailCfg *MailConfig) *PlatformRegistr
 
 	return &PlatformRegistrar{
 		deviceID:        uuid.New().String(),
+		flareSolverrURL:  flareSolverrURL,
 		proxyURL:        proxyURL,
 		mailCfg:         mailCfg,
 		userAgent:       userAgent,
@@ -95,6 +96,25 @@ func (r *PlatformRegistrar) Register(ctx context.Context, index int, log func(st
 		return nil, fmt.Errorf("init client: %w", err)
 	}
 	defer r.Close()
+
+	// Use FlareSolverr to solve Cloudflare challenge if configured
+	if r.flareSolverrURL != "" {
+		log(fmt.Sprintf("[任务%d] 使用 FlareSolverr 获取 Cloudflare cookies", index), "info")
+		cookies, ua, err := r.solveFlare(ctx, authBase)
+		if err != nil {
+			log(fmt.Sprintf("[任务%d] FlareSolverr 失败: %v，继续尝试直接连接", index, err), "yellow")
+		} else {
+			// Apply cookies to our client
+			if len(cookies) > 0 {
+				r.client.Jar.SetCookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}, cookies)
+				r.client.Jar.SetCookies(&url.URL{Scheme: "https", Host: ".auth.openai.com"}, cookies)
+				log(fmt.Sprintf("[任务%d] FlareSolverr 成功，获取 %d 个 cookies", index, len(cookies)), "green")
+			}
+			if ua != "" {
+				r.userAgent = ua
+			}
+		}
+	}
 
 	// 1. Create mailbox
 	log(fmt.Sprintf("[任务%d] 开始创建邮箱", index), "info")
@@ -181,6 +201,7 @@ func (r *PlatformRegistrar) Register(ctx context.Context, index int, log func(st
 		RefreshToken: tokens.RefreshToken,
 		IDToken:      tokens.IDToken,
 		SessionToken: tokens.SessionToken,
+		ExpiresIn:    tokens.ExpiresIn,
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
@@ -193,19 +214,34 @@ func (r *PlatformRegistrar) initClient() error {
 		return err
 	}
 
+	// Use standard HTTP transport with proxy
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		DisableCompression: false,
+	}
+
+	// Configure proxy if set
+	if r.proxyURL != "" {
+		proxyURL, err := url.Parse(r.proxyURL)
+		if err != nil {
+			return fmt.Errorf("parse proxy URL: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+
 	r.client = &http.Client{
 		Jar:     jar,
 		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-			DisableCompression: false,
-		},
+		Transport: transport,
 	}
 
 	// Set cookies
 	r.client.Jar.SetCookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}, []*http.Cookie{
+		{Name: "oai-did", Value: r.deviceID},
+	})
+	r.client.Jar.SetCookies(&url.URL{Scheme: "https", Host: ".auth.openai.com"}, []*http.Cookie{
 		{Name: "oai-did", Value: r.deviceID},
 	})
 
@@ -216,9 +252,100 @@ func (r *PlatformRegistrar) Close() {
 	if r.client != nil {
 		r.client.CloseIdleConnections()
 	}
-	if r.utlsConn != nil {
-		r.utlsConn.Close()
+}
+
+// solveFlare calls FlareSolverr to solve Cloudflare challenge and get cookies.
+// Retries up to 3 times if cf_clearance cookie is missing.
+func (r *PlatformRegistrar) solveFlare(ctx context.Context, targetURL string) ([]*http.Cookie, string, error) {
+	if r.flareSolverrURL == "" {
+		return nil, "", nil
 	}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		cookies, ua, err := r.solveFlareOnce(ctx, targetURL)
+		if err != nil {
+			return nil, "", err
+		}
+
+		// Check for cf_clearance cookie
+		hasClearance := false
+		for _, c := range cookies {
+			if c.Name == "cf_clearance" {
+				hasClearance = true
+				break
+			}
+		}
+
+		if hasClearance && len(cookies) >= 2 {
+			return cookies, ua, nil
+		}
+
+		if attempt < 2 {
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	// Last attempt: return whatever we got
+	return r.solveFlareOnce(ctx, targetURL)
+}
+
+func (r *PlatformRegistrar) solveFlareOnce(ctx context.Context, targetURL string) ([]*http.Cookie, string, error) {
+	fsReq := map[string]interface{}{
+		"cmd":         "request.get",
+		"url":         targetURL,
+		"max_timeout": 120,
+	}
+
+	fsBody, _ := json.Marshal(fsReq)
+
+	fsClient := &http.Client{Timeout: 180 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, "POST", r.flareSolverrURL+"/v1", bytes.NewReader(fsBody))
+	if err != nil {
+		return nil, "", fmt.Errorf("create flaresolverr request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := fsClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("flaresolverr request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var fsResult struct {
+		Status   string `json:"status"`
+		Message  string `json:"message"`
+		Solution struct {
+			URL     string `json:"url"`
+			Status  int    `json:"status"`
+			Cookies []struct {
+				Name    string `json:"name"`
+				Value   string `json:"value"`
+				Domain  string `json:"domain"`
+				Path    string `json:"path"`
+			} `json:"cookies"`
+			UserAgent string `json:"userAgent"`
+		} `json:"solution"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&fsResult); err != nil {
+		return nil, "", fmt.Errorf("decode flaresolverr response: %w", err)
+	}
+
+	if fsResult.Status != "ok" {
+		return nil, "", fmt.Errorf("flaresolverr failed: %s", fsResult.Message)
+	}
+
+	cookies := make([]*http.Cookie, len(fsResult.Solution.Cookies))
+	for i, c := range fsResult.Solution.Cookies {
+		cookies[i] = &http.Cookie{
+			Name:   c.Name,
+			Value:  c.Value,
+			Domain: c.Domain,
+			Path:   c.Path,
+		}
+	}
+
+	return cookies, fsResult.Solution.UserAgent, nil
 }
 
 func (r *PlatformRegistrar) createMailbox(ctx context.Context) (*Mailbox, error) {
@@ -464,6 +591,7 @@ type tokenResult struct {
 	RefreshToken string `json:"refresh_token"`
 	IDToken      string `json:"id_token"`
 	SessionToken string `json:"session_token,omitempty"`
+	ExpiresIn    int    `json:"expires_in"`
 }
 
 func (r *PlatformRegistrar) loginAndExchangeTokens(ctx context.Context, email, password string, mailbox *Mailbox) (*tokenResult, error) {
@@ -473,12 +601,24 @@ func (r *PlatformRegistrar) loginAndExchangeTokens(ctx context.Context, email, p
 
 	// Create new client for login
 	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	if r.proxyURL != "" {
+		proxyURL, err := url.Parse(r.proxyURL)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
 	loginClient := &http.Client{
 		Jar:     jar,
 		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
+		Transport: transport,
+	}
+	// Copy Cloudflare clearance cookies from main client
+	for _, c := range r.client.Jar.Cookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}) {
+		loginClient.Jar.SetCookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}, []*http.Cookie{c})
 	}
 	loginClient.Jar.SetCookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}, []*http.Cookie{
 		{Name: "oai-did", Value: loginDeviceID},
@@ -509,7 +649,7 @@ func (r *PlatformRegistrar) loginAndExchangeTokens(ctx context.Context, email, p
 	req, _ := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	r.setNavigateHeadersWithDevice(req, platformBase+"/", loginDeviceID)
 
-	resp, err := loginClient.Do(req)
+	resp, err := doWithRetry(loginClient, req, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -543,10 +683,9 @@ func (r *PlatformRegistrar) loginAndExchangeTokens(ctx context.Context, email, p
 	req, _ = http.NewRequestWithContext(ctx, "POST", authBase+"/api/accounts/password/verify", bytes.NewReader(pwBytes))
 	r.setJSONHeadersWithDevice(req, authBase+"/log-in/password", loginDeviceID)
 
-	sentinelToken, _ = sentinel.BuildSentinelToken(r, "password_verify")
-	if sentinelToken != "" {
-		req.Header.Set("openai-sentinel-token", sentinelToken)
-	}
+	// Note: sentinel token for password_verify seems to trigger consent page,
+	// so skip it for now to get the code directly in continue_url.
+	// sentinelToken, _ := sentinel.BuildSentinelToken(r, "password_verify")
 
 	resp, err = loginClient.Do(req)
 	if err != nil {
@@ -609,6 +748,13 @@ func (r *PlatformRegistrar) loginAndExchangeTokens(ctx context.Context, email, p
 }
 
 func (r *PlatformRegistrar) exchangeTokens(ctx context.Context, client *http.Client, deviceID, codeVerifier, consentURL string) (*tokenResult, error) {
+	// Check if code is already in the consent URL
+	if u, err := url.Parse(consentURL); err == nil {
+		if code := u.Query().Get("code"); code != "" {
+			return r.tokenExchangeDirect(ctx, client, code, codeVerifier)
+		}
+	}
+
 	// Navigate consent URL to get OAuth code
 	req, _ := http.NewRequestWithContext(ctx, "GET", consentURL, nil)
 	r.setNavigateHeadersWithDevice(req, consentURL, deviceID)
@@ -628,19 +774,27 @@ func (r *PlatformRegistrar) exchangeTokens(ctx context.Context, client *http.Cli
 
 	// Extract code from Location header or final URL
 	var code string
+	locCount := 0
 	for i := 0; i < 10; i++ {
 		location := resp.Header.Get("Location")
 		if location == "" {
 			break
 		}
+		locCount++
 
 		if strings.Contains(location, "code=") {
-			u, err := url.Parse(location)
-			if err == nil {
+			if u, err := url.Parse(location); err == nil {
 				code = u.Query().Get("code")
-				if code != "" {
-					break
+			}
+			if code == "" {
+				idx := strings.Index(location, "code=")
+				code = location[idx+5:]
+				if ampIdx := strings.Index(code, "&"); ampIdx >= 0 {
+					code = code[:ampIdx]
 				}
+			}
+			if code != "" {
+				break
 			}
 		}
 
@@ -657,11 +811,188 @@ func (r *PlatformRegistrar) exchangeTokens(ctx context.Context, client *http.Cli
 		resp.Body.Close()
 	}
 
+	// Fallback 1: Extract workspace_id from oai-client-auth-session cookie,
+	// then POST workspace/select and organization/select to trigger redirect.
+	wsDiag := ""
 	if code == "" {
-		return nil, fmt.Errorf("failed to extract OAuth code")
+		for _, c := range client.Jar.Cookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}) {
+			if c.Name == "oai-client-auth-session" && c.Value != "" {
+				workspaceID := extractWorkspaceID(c.Value); if workspaceID == "" { wsDiag = fmt.Sprintf("cookie=%s", c.Value[:min(80, len(c.Value))]) }
+				wsDiag = fmt.Sprintf("wsID=%s", workspaceID[:min(20, len(workspaceID))])
+				if workspaceID != "" {
+					wsBody, _ := json.Marshal(map[string]string{"workspace_id": workspaceID})
+					wsReq, _ := http.NewRequestWithContext(ctx, "POST", authBase+"/api/accounts/workspace/select", bytes.NewReader(wsBody))
+					r.setJSONHeadersWithDevice(wsReq, consentURL, deviceID)
+					wsResp, wsErr := client.Do(wsReq)
+					if wsErr == nil {
+						wsLoc := wsResp.Header.Get("Location")
+						wsB, _ := io.ReadAll(wsResp.Body)
+						wsResp.Body.Close()
+						wsDiag = fmt.Sprintf("wsResp=%d loc=%s", wsResp.StatusCode, wsLoc[:min(60, len(wsLoc))])
+						if strings.Contains(wsLoc, "code=") {
+							code = extractCodeFromURL(wsLoc)
+						} else {
+							orgID, projectID := extractOrgFromResponse(wsB)
+							wsDiag = fmt.Sprintf("%s orgID=%s", wsDiag, orgID[:min(20, len(orgID))])
+							if orgID != "" {
+								orgBody, _ := json.Marshal(map[string]string{
+									"org_id":     orgID,
+									"project_id": projectID,
+								})
+								orgReq, _ := http.NewRequestWithContext(ctx, "POST", authBase+"/api/accounts/organization/select", bytes.NewReader(orgBody))
+								r.setJSONHeadersWithDevice(orgReq, consentURL, deviceID)
+								orgResp, orgErr := client.Do(orgReq)
+								if orgErr == nil {
+									orgLoc := orgResp.Header.Get("Location")
+									io.ReadAll(orgResp.Body)
+									orgResp.Body.Close()
+									wsDiag = fmt.Sprintf("%s orgResp=%d loc=%s", wsDiag, orgResp.StatusCode, orgLoc[:min(60, len(orgLoc))])
+									if strings.Contains(orgLoc, "code=") {
+										code = extractCodeFromURL(orgLoc)
+									}
+								} else {
+									wsDiag = fmt.Sprintf("%s orgErr=%v", wsDiag, orgErr)
+								}
+							}
+						}
+					} else {
+						wsDiag = fmt.Sprintf("wsErr=%v", wsErr)
+					}
+				}
+				break
+			}
+		}
 	}
 
-	// Exchange code for tokens
+	// Fallback 2: Do GET with allow_redirects and extract code from final URL
+	if code == "" {
+		client.CheckRedirect = nil
+		req, _ = http.NewRequestWithContext(ctx, "GET", consentURL, nil)
+		r.setNavigateHeadersWithDevice(req, consentURL, deviceID)
+		finalResp, err := client.Do(req)
+		if err == nil {
+			finalURL := finalResp.Request.URL.String()
+			io.ReadAll(finalResp.Body)
+			finalResp.Body.Close()
+			code = extractCodeFromURL(finalURL)
+		}
+	}
+
+	if code == "" {
+		// Gather diagnostics
+		hasAuthCookie := false
+		for _, c := range client.Jar.Cookies(&url.URL{Scheme: "https", Host: "auth.openai.com"}) {
+			if c.Name == "oai-client-auth-session" && c.Value != "" {
+				hasAuthCookie = true
+				break
+			}
+		}
+		return nil, fmt.Errorf("failed to extract OAuth code (consent=%s, locCount=%d, hasAuthCookie=%v, wsDiag=%s)",
+			consentURL[:min(60, len(consentURL))], locCount, hasAuthCookie, wsDiag)
+	}
+
+	return r.tokenExchangeDirect(ctx, client, code, codeVerifier)
+}
+
+
+// extractWorkspaceID extracts workspace_id from the oai-client-auth-session JWT cookie.
+// The JWT payload has: {"workspaces": [{"id": "..."}]}
+func extractWorkspaceID(cookieValue string) string {
+	parts := strings.Split(cookieValue, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload := parts[0]
+	// Add padding
+	if m := len(payload) % 4; m != 0 {
+		payload += strings.Repeat("=", 4-m)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		decoded, err = base64.RawURLEncoding.DecodeString(payload)
+		if err != nil {
+			return ""
+		}
+	}
+	var data struct {
+		Workspaces []struct {
+			ID string `json:"id"`
+		} `json:"workspaces"`
+	}
+	if json.Unmarshal(decoded, &data) == nil && len(data.Workspaces) > 0 {
+		return data.Workspaces[0].ID
+	}
+	return ""
+}
+
+// extractCodeFromURL extracts the OAuth authorization code from a URL string.
+func extractCodeFromURL(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		if code := u.Query().Get("code"); code != "" {
+			return code
+		}
+	}
+	idx := strings.Index(rawURL, "code=")
+	if idx < 0 {
+		return ""
+	}
+	code := rawURL[idx+5:]
+	if ampIdx := strings.Index(code, "&"); ampIdx >= 0 {
+		code = code[:ampIdx]
+	}
+	return code
+}
+
+// extractOrgFromResponse extracts org_id and project_id from workspace/select response.
+// Response format: {"id": "org-xxx", "projects": [{"id": "proj-xxx"}]}
+func extractOrgFromResponse(body []byte) (string, string) {
+	var data struct {
+		ID       string `json:"id"`
+		Projects []struct {
+			ID string `json:"id"`
+		} `json:"projects"`
+	}
+	if json.Unmarshal(body, &data) != nil {
+		return "", ""
+	}
+	if len(data.Projects) > 0 {
+		return data.ID, data.Projects[0].ID
+	}
+	return data.ID, ""
+}
+
+// doWithRetry executes an HTTP request with retry on EOF/timeout errors.
+func doWithRetry(client *http.Client, req *http.Request, maxRetry int) (*http.Response, error) {
+	var lastErr error
+	for i := 0; i < maxRetry; i++ {
+		// Clone body for retries
+		var reqCopy *http.Request
+		if i == 0 {
+			reqCopy = req
+		} else {
+			reqCopy = req.Clone(req.Context())
+			if req.Body != nil {
+				// Can't retry with body without re-reading it
+				return nil, lastErr
+			}
+		}
+		resp, err := client.Do(reqCopy)
+		if err == nil {
+			return resp, nil
+		}
+		// Only retry on EOF and timeout errors
+		errStr := err.Error()
+		if strings.Contains(errStr, "EOF") || strings.Contains(errStr, "timeout") || strings.Contains(errStr, "connection reset") {
+			lastErr = err
+			time.Sleep(time.Duration(i+1) * time.Second)
+			continue
+		}
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+func (r *PlatformRegistrar) tokenExchangeDirect(ctx context.Context, client *http.Client, code, codeVerifier string) (*tokenResult, error) {
 	tokenReq := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -670,10 +1001,10 @@ func (r *PlatformRegistrar) exchangeTokens(ctx context.Context, client *http.Cli
 		"code_verifier": {codeVerifier},
 	}
 
-	req, _ = http.NewRequestWithContext(ctx, "POST", authBase+"/oauth/token", strings.NewReader(tokenReq.Encode()))
+	req, _ := http.NewRequestWithContext(ctx, "POST", authBase+"/oauth/token", strings.NewReader(tokenReq.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err = client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -688,12 +1019,12 @@ func (r *PlatformRegistrar) exchangeTokens(ctx context.Context, client *http.Cli
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		IDToken      string `json:"id_token"`
+		ExpiresIn    int    `json:"expires_in"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("parse token response: %w", err)
 	}
 
-	// Extract session token from cookies
 	var sessionToken string
 	for _, cookie := range client.Jar.Cookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}) {
 		if cookie.Name == "__Secure-next-auth.session-token" {
@@ -707,9 +1038,11 @@ func (r *PlatformRegistrar) exchangeTokens(ctx context.Context, client *http.Cli
 		RefreshToken: tokenResp.RefreshToken,
 		IDToken:      tokenResp.IDToken,
 		SessionToken: sessionToken,
+		ExpiresIn:    tokenResp.ExpiresIn,
 	}, nil
 }
 
+// HTTPSession implementation for sentinel
 // HTTPSession implementation for sentinel
 func (r *PlatformRegistrar) Post(url string, body []byte, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))

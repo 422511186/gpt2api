@@ -169,7 +169,10 @@ func (p *BaseMailProvider) WaitForCode(
 
 		message, err := fetchMessage(ctx, mailbox)
 		if err != nil {
-			return "", err
+			// Log error but continue waiting - transient errors like rate limiting shouldn't fail immediately
+			// Only fail on context cancellation or deadline exceeded
+			time.Sleep(waitInterval)
+			continue
 		}
 
 		if message != nil {

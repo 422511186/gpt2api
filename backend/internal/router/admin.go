@@ -73,7 +73,7 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 	dashboardH := handler.NewAdminDashboardHandler(dashboardRepo)
 
 	// === register service ===
-	registerSvc := register.NewRegisterService(accountRepo, deps.AES, pool)
+	registerSvc := register.NewRegisterService(accountRepo, sysCfgRepo, deps.AES, pool)
 	registerH := handler.NewRegisterHandler(registerSvc)
 
 	// auth 公开
@@ -173,8 +173,10 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 			reg.POST("/start", registerH.Start)
 			reg.POST("/stop", registerH.Stop)
 			reg.POST("/reset", registerH.Reset)
-			reg.GET("/events", registerH.Events)
 		}
+
+		// SSE 事件流：使用 AuthJWTOrQuery 以支持 EventSource 无法设置 header 的场景
+		v1.GET("/register/events", middleware.AuthJWTOrQuery(deps.JWT, jwtx.SubjectAdmin), registerH.Events)
 	}
 
 	return pool
