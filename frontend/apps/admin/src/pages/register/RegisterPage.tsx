@@ -114,6 +114,7 @@ export default function RegisterPage() {
       const body: RegisterConfigReq = {
         mail: config.mail,
         proxy: config.proxy,
+        flaresolverr_url: config.flaresolverr_url,
         total: config.total,
         threads: config.threads,
         mode: config.mode,
