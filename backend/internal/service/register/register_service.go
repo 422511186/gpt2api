@@ -571,6 +571,7 @@ func (s *RegisterService) saveToAccountPool(result *RegistrationResult) error {
 		"email":      result.Email,
 		"password":   result.Password,
 		"created_at": result.CreatedAt,
+		"client_id":  platformOAuthClientID, // 注册机使用的 client_id
 	}
 	metaBytes, _ := json.Marshal(meta)
 	metaStr := string(metaBytes)
