@@ -16,12 +16,13 @@ const (
 	AuthTypeOAuth  = "oauth"
 )
 
-// Account 状态：1启用 0停用 2熔断 -1禁用。
+// Account 状态：1启用 0停用 2熔断 3失效 -1封禁。
 const (
 	AccountStatusEnabled  = 1
-	AccountStatusDisabled = 0
-	AccountStatusBroken   = 2
-	AccountStatusBanned   = -1
+	AccountStatusDisabled = 0  // 用户手动禁用
+	AccountStatusBroken   = 2  // 临时异常（熔断，cooldown到期后自动恢复）
+	AccountStatusInvalid  = 3  // 系统检测失效（永久）
+	AccountStatusBanned   = -1 // 封禁
 )
 
 // 测试结果：0未测 1OK 2失败。

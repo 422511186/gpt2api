@@ -54,16 +54,17 @@ type AccountUpdateReq struct {
 // 当 auth_type=oauth 时，每行的 credential 实际为 OpenAI Codex CLI 的 refresh_token。
 //
 // format=sub2api：兼容 sub2api / Codex 等导出的 JSON（顶层含 accounts[]）。
+// format=session_tokens：每行一个 session token，自动填充占位的 access_token 和 refresh_token。
 // 单次请求 accounts 建议 ≤500 条，大块导入请前端分批 POST。
 type AccountBatchImportReq struct {
-	Format   string `json:"format"    binding:"omitempty,oneof=lines sub2api"`
+	Format   string `json:"format"    binding:"omitempty,oneof=lines sub2api session_tokens"`
 	Provider string `json:"provider"  binding:"required,oneof=gpt grok"`
-	// lines 模式必填；sub2api 可省略（由每条 account.type / platform 推导）
+	// lines 模式必填；sub2api / session_tokens 可省略（由每条 account.type / platform 推导）
 	AuthType string  `json:"auth_type" binding:"omitempty,oneof=api_key cookie oauth"`
 	BaseURL  string  `json:"base_url"  binding:"omitempty,url"`
 	ProxyID  *uint64 `json:"proxy_id" binding:"omitempty"`
 	Weight   int     `json:"weight"    binding:"omitempty,min=1,max=1000"`
-	// lines 模式：多行文本
+	// lines / session_tokens 模式：多行文本
 	Text string `json:"text"`
 	// sub2api 模式：解析后的账号切片
 	Accounts []Sub2APIAccountItem `json:"accounts"`
@@ -121,7 +122,7 @@ type AccountRefreshResp struct {
 	HasRefreshTK bool  `json:"has_refresh_token"`
 }
 
-// AccountListReq 列表过滤。
+// AccountBatchProbeResp 批量检测用量结果。
 type AccountBatchProbeResp struct {
 	Probed    int      `json:"probed"`
 	FailedIDs []uint64 `json:"failed_ids"`
@@ -130,6 +131,20 @@ type AccountBatchProbeResp struct {
 	Total     int64    `json:"total"`
 	HasMore   bool     `json:"has_more"`
 	NextPage  int      `json:"next_page,omitempty"`
+}
+
+// AccountBatchCheckInvalidResp 批量检测失效账号结果。
+type AccountBatchCheckInvalidResp struct {
+	Checked          int      `json:"checked"`
+	MarkedInvalid    int      `json:"marked_invalid"`
+	MarkedInvalidIDs []uint64 `json:"marked_invalid_ids"`
+	OKIDs            []uint64 `json:"ok_ids"`
+	FailedIDs        []uint64 `json:"failed_ids"`
+	Page             int      `json:"page"`
+	PageSize         int      `json:"page_size"`
+	Total            int64    `json:"total"`
+	HasMore          bool     `json:"has_more"`
+	NextPage         int      `json:"next_page,omitempty"`
 }
 
 // AccountBatchRefreshResp 批量刷新 OAuth 结果。
@@ -141,6 +156,31 @@ type AccountBatchRefreshResp struct {
 	Total     int64    `json:"total"`
 	HasMore   bool     `json:"has_more"`
 	NextPage  int      `json:"next_page,omitempty"`
+}
+
+// AccountProviderStatsResp 账号池按 provider 聚合统计。
+type AccountProviderStatsResp struct {
+	Provider       string `json:"provider"`
+	Total          int64  `json:"total"`
+	Enabled        int64  `json:"enabled"`
+	Available      int64  `json:"available"`
+	Broken         int64  `json:"broken"`
+	QuotaRemaining int64  `json:"quota_remaining"`
+	QuotaTotal     int64  `json:"quota_total"`
+	TotalQuota     int64  `json:"total_quota"`
+}
+
+// AccountPoolStatsResp 账号池统计。pool 保留旧的内存池可用数量字段。
+type AccountPoolStatsResp struct {
+	Pool           map[string]int             `json:"pool"`
+	Total          int64                      `json:"total"`
+	Enabled        int64                      `json:"enabled"`
+	Available      int64                      `json:"available"`
+	Broken         int64                      `json:"broken"`
+	QuotaRemaining int64                      `json:"quota_remaining"`
+	QuotaTotal     int64                      `json:"quota_total"`
+	TotalQuota     int64                      `json:"total_quota"`
+	Providers      []AccountProviderStatsResp `json:"providers"`
 }
 
 type AccountListReq struct {
@@ -175,6 +215,7 @@ type AccountResp struct {
 	Remark              string `json:"remark,omitempty"`
 	HasRefreshToken     bool   `json:"has_refresh_token"`
 	HasAccessToken      bool   `json:"has_access_token"`
+	HasSessionToken     bool   `json:"has_session_token"`
 	AccessTokenExpireAt int64  `json:"access_token_expire_at,omitempty"`
 	LastRefreshAt       int64  `json:"last_refresh_at,omitempty"`
 	LastTestAt          int64  `json:"last_test_at,omitempty"`
@@ -195,6 +236,12 @@ type AccountBatchDeleteReq struct {
 	IDs []uint64 `json:"ids" binding:"required,min=1,max=2000,dive,min=1"`
 }
 
+// AccountBatchStatusReq 按 ID 批量修改状态。
+type AccountBatchStatusReq struct {
+	IDs    []uint64 `json:"ids" binding:"required,min=1,max=2000,dive,min=1"`
+	Status *int8    `json:"status" binding:"required"`
+}
+
 // AccountPurgeReq 按条件批量软删。
 // invalid：status∈{0,2} 或 last_test_status=失败。
 // all：当前列表中未软删的全部账号；须 confirm=DELETE_ALL_ACCOUNTS。
@@ -207,6 +254,11 @@ type AccountPurgeReq struct {
 // AccountBulkOpResult 批量删除结果。
 type AccountBulkOpResult struct {
 	Deleted int64 `json:"deleted"`
+}
+
+// AccountBatchStatusResp 批量修改状态结果。
+type AccountBatchStatusResp struct {
+	Updated int `json:"updated"`
 }
 
 // AccountBatchAssignProxyReq 批量设置账号代理。

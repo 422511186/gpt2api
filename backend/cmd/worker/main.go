@@ -8,6 +8,7 @@ import (
 	"context"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/hibiken/asynq"
 	"go.uber.org/zap"
@@ -41,10 +42,26 @@ func main() {
 		logger.L().Fatal("worker requires redis")
 	}
 
-	if deps.DB != nil {
-		sysCfgSvc := service.NewSystemConfigService(repo.NewSystemConfigRepo(deps.DB))
-		proxySvc := service.NewProxyService(repo.NewProxyRepo(deps.DB), deps.AES)
+	if deps.DB != nil && deps.AES != nil {
+		// 初始化 repos
+		sysCfgRepo := repo.NewSystemConfigRepo(deps.DB)
+		accountRepo := repo.NewAccountRepo(deps.DB)
+		proxyRepo := repo.NewProxyRepo(deps.DB)
+
+		// 初始化 services
+		sysCfgSvc := service.NewSystemConfigService(sysCfgRepo)
+		proxySvc := service.NewProxyService(proxyRepo, deps.AES)
+		pool := service.NewAccountPool(accountRepo, 30*time.Second)
+		accountAdmin := service.NewAccountAdminService(accountRepo, pool, deps.AES)
+		openaiOAuth := service.NewOpenAIOAuthService(sysCfgSvc)
+		accountTest := service.NewAccountTestService(accountRepo, pool, proxySvc, sysCfgSvc, openaiOAuth, deps.AES)
+		accountAdmin.SetTestService(accountTest)
+
+		// Grok CF Refresh 服务
 		service.NewGrokCFRefreshService(sysCfgSvc, proxySvc).Start(context.Background())
+
+		// 账号失效检测服务
+		service.NewAccountInvalidCheckService(sysCfgSvc, accountAdmin, accountTest, accountRepo).Start(context.Background())
 	}
 
 	srv := asynq.NewServer(

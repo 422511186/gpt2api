@@ -298,6 +298,46 @@ func (s *AccountAdminService) BatchDeleteByIDs(ctx context.Context, ids []uint64
 	return n, nil
 }
 
+// BatchUpdateStatus 批量修改账号状态。
+func (s *AccountAdminService) BatchUpdateStatus(ctx context.Context, req *dto.AccountBatchStatusReq) (*dto.AccountBatchStatusResp, error) {
+	if len(req.IDs) == 0 {
+		return nil, errcode.InvalidParam.WithMsg("ids 不能为空")
+	}
+	if req.Status == nil {
+		return nil, errcode.InvalidParam.WithMsg("status 不能为空")
+	}
+	status := *req.Status
+	switch status {
+	case model.AccountStatusEnabled, model.AccountStatusDisabled, model.AccountStatusBroken, model.AccountStatusInvalid, model.AccountStatusBanned:
+	default:
+		return nil, errcode.InvalidParam.WithMsg("status 仅支持 -1/0/1/2/3")
+	}
+
+	updated := 0
+	seenProvider := map[string]struct{}{}
+	for _, id := range req.IDs {
+		acc, err := s.repo.GetByID(ctx, id)
+		if err != nil {
+			return nil, errcode.ResourceMissing.WithMsg(fmt.Sprintf("账号 %d 不存在", id))
+		}
+		fields := map[string]any{"status": status}
+		if status == model.AccountStatusEnabled {
+			fields["cooldown_until"] = nil
+			fields["last_error"] = nil
+			fields["error_count"] = 0
+		}
+		if err := s.repo.Update(ctx, id, fields); err != nil {
+			return nil, errcode.DBError.Wrap(err)
+		}
+		seenProvider[acc.Provider] = struct{}{}
+		updated++
+	}
+	for provider := range seenProvider {
+		s.pool.Reload(provider)
+	}
+	return &dto.AccountBatchStatusResp{Updated: updated}, nil
+}
+
 // GetSecrets 解密返回单个账号的明文凭证（管理员专用，用于编辑面板回显）。
 // 解密失败的字段返回空串，不阻断响应。
 func (s *AccountAdminService) GetSecrets(ctx context.Context, id uint64) (*dto.AccountSecretsResp, error) {
@@ -386,6 +426,7 @@ func (s *AccountAdminService) List(ctx context.Context, req *dto.AccountListReq)
 }
 
 // BatchImport 文本行导入（format=lines）或 sub2api JSON 分片导入（format=sub2api）。
+// 新增 format=session_tokens：每行一个 session token，自动填充占位的 access_token 和 refresh_token。
 func (s *AccountAdminService) BatchImport(ctx context.Context, adminID uint64, req *dto.AccountBatchImportReq) (*dto.BatchImportResult, error) {
 	format := strings.ToLower(strings.TrimSpace(req.Format))
 	if format == "" {
@@ -393,6 +434,9 @@ func (s *AccountAdminService) BatchImport(ctx context.Context, adminID uint64, r
 	}
 	if format == "sub2api" {
 		return s.batchImportSub2API(ctx, adminID, req)
+	}
+	if format == "session_tokens" {
+		return s.batchImportSessionTokens(ctx, adminID, req)
 	}
 	if strings.TrimSpace(req.AuthType) == "" {
 		return nil, errcode.InvalidParam.WithMsg("auth_type 不能为空")
@@ -621,6 +665,114 @@ func mapSub2APIPlatform(p string) string {
 	}
 }
 
+// batchImportSessionTokens 批量导入 session token，每行一个 session token。
+// 自动填充占位的 access_token 和 refresh_token，auth_type 固定为 oauth。
+func (s *AccountAdminService) batchImportSessionTokens(ctx context.Context, adminID uint64, req *dto.AccountBatchImportReq) (*dto.BatchImportResult, error) {
+	if strings.TrimSpace(req.Text) == "" {
+		return nil, errcode.InvalidParam.WithMsg("text 不能为空")
+	}
+
+	provider := req.Provider
+	if provider == "" {
+		provider = model.ProviderGPT
+	}
+
+	weight := req.Weight
+	if weight <= 0 {
+		weight = 10
+	}
+
+	lines := strings.Split(req.Text, "\n")
+	items := make([]*model.Account, 0, len(lines))
+	skipped := 0
+
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// session token 作为主要凭证，同时填入 AT/RT 以便后续直接使用
+		st := line
+		name := fmt.Sprintf("session-%d-%s", i+1, shortTokenName(st))
+
+		// 加密 session token（用于 AT/RT/ST 三个字段）
+		stEnc, err := s.aes.Encrypt([]byte(st))
+		if err != nil {
+			skipped++
+			continue
+		}
+
+		// access_token、refresh_token、session_token 都使用同一个 session token
+		// 这样后续测试时可以直接用 session token 进行认证
+		atEnc := stEnc
+		rtEnc := stEnc
+
+		// credential_enc 使用 session token
+		credEnc := stEnc
+
+		a := &model.Account{
+			Provider:        provider,
+			Name:            name,
+			AuthType:        model.AuthTypeOAuth,
+			CredentialEnc:   credEnc,
+			RefreshTokenEnc: rtEnc,
+			AccessTokenEnc:  atEnc,
+			SessionTokenEnc: stEnc,
+			Weight:          weight,
+			Status:          model.AccountStatusEnabled,
+			CreatedBy:       &adminID,
+		}
+
+		// 设置 access_token 过期时间为 30 天后（session token 可直接使用）
+		expireAt := time.Now().Add(30 * 24 * time.Hour).UTC()
+		a.AccessTokenExpiresAt = &expireAt
+
+		if req.ProxyID != nil && *req.ProxyID > 0 {
+			pid := *req.ProxyID
+			a.ProxyID = &pid
+		}
+
+		// 设置 OAuth meta，标记来源为 session_token 导入
+		meta := map[string]any{
+			"source":        "session_token_import",
+			"imported_at":   time.Now().UTC().Format(time.RFC3339),
+			"needs_refresh": true,
+		}
+		if mb, err := json.Marshal(meta); err == nil {
+			ms := string(mb)
+			a.OAuthMeta = &ms
+		}
+
+		items = append(items, a)
+	}
+
+	if len(items) == 0 {
+		return &dto.BatchImportResult{Imported: 0, Skipped: skipped}, nil
+	}
+
+	if err := s.repo.BatchCreate(ctx, items); err != nil {
+		return nil, errcode.DBError.Wrap(err)
+	}
+
+	s.pool.Reload(provider)
+
+	return &dto.BatchImportResult{
+		Imported: len(items),
+		Skipped:  skipped,
+	}, nil
+}
+
+// randomTokenSuffix 生成随机后缀用于占位 token
+func randomTokenSuffix() string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 8)
+	for i := range b {
+		b[i] = charset[i%len(charset)]
+	}
+	return string(b)
+}
+
 func accountClientIDFromImport(c *dto.Sub2APICreds) string {
 	if c == nil {
 		return ""
@@ -741,6 +893,31 @@ func (s *AccountAdminService) BatchRefreshOAuth(ctx context.Context, provider st
 	}, nil
 }
 
+// PoolStats 返回账号池 DB 聚合统计与内存调度池数量。
+func (s *AccountAdminService) PoolStats(ctx context.Context) (*dto.AccountPoolStatsResp, error) {
+	providers, err := s.repo.ProviderStats(ctx)
+	if err != nil {
+		return nil, errcode.DBError.Wrap(err)
+	}
+	out := &dto.AccountPoolStatsResp{
+		Pool:      map[string]int{},
+		Providers: providers,
+	}
+	if s.pool != nil {
+		out.Pool = s.pool.Stats()
+	}
+	for _, row := range providers {
+		out.Total += row.Total
+		out.Enabled += row.Enabled
+		out.Available += row.Available
+		out.Broken += row.Broken
+		out.QuotaRemaining += row.QuotaRemaining
+		out.QuotaTotal += row.QuotaTotal
+		out.TotalQuota += row.TotalQuota
+	}
+	return out, nil
+}
+
 func (s *AccountAdminService) BatchProbeQuota(ctx context.Context, provider string, page, pageSize int) (*dto.AccountBatchProbeResp, error) {
 	if s.testSvc == nil {
 		return nil, errcode.Internal.WithMsg("quota probe service disabled")
@@ -796,6 +973,109 @@ func (s *AccountAdminService) BatchProbeQuota(ctx context.Context, provider stri
 		NextPage:  nextPage,
 	}, nil
 }
+
+// BatchCheckInvalid 检测账号有效性，自动标记失效账号（401 或明确凭证失效）。
+func (s *AccountAdminService) BatchCheckInvalid(ctx context.Context, provider string, page, pageSize int) (*dto.AccountBatchCheckInvalidResp, error) {
+	if s.testSvc == nil {
+		return nil, errcode.Internal.WithMsg("test service disabled")
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 1000 {
+		pageSize = 1000
+	}
+
+	items, total, err := s.repo.List(ctx, repo.AccountListFilter{
+		Provider: provider,
+		Page:     page,
+		PageSize: pageSize,
+	})
+	if err != nil {
+		return nil, errcode.DBError.Wrap(err)
+	}
+
+	checked := 0
+	markedInvalid := 0
+	markedInvalidIDs := []uint64{}
+	okIDs := []uint64{}
+	failedIDs := []uint64{}
+	var mu sync.Mutex
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+
+	for _, acc := range items {
+		a := acc
+		if a.Status != model.AccountStatusEnabled {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			res, err := s.testSvc.TestWithInvalidCheck(ctx, a)
+			mu.Lock()
+			defer mu.Unlock()
+			checked++
+
+			if err != nil || res == nil {
+				failedIDs = append(failedIDs, a.ID)
+				return
+			}
+
+			if res.ShouldDisable {
+				// 标记为失效状态
+				if err := s.repo.Update(ctx, a.ID, map[string]any{
+					"status":     model.AccountStatusInvalid,
+					"last_error": res.Error,
+				}); err == nil {
+					markedInvalid++
+					markedInvalidIDs = append(markedInvalidIDs, a.ID)
+				}
+			} else if res.OK {
+				okIDs = append(okIDs, a.ID)
+			} else {
+				failedIDs = append(failedIDs, a.ID)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if provider != "" {
+		s.pool.Reload(provider)
+	} else {
+		s.reloadPoolGPTAndGrok()
+	}
+
+	hasMore := page*pageSize < int(total)
+	nextPage := 0
+	if hasMore {
+		nextPage = page + 1
+	}
+	return &dto.AccountBatchCheckInvalidResp{
+		Checked:          checked,
+		MarkedInvalid:    markedInvalid,
+		MarkedInvalidIDs: markedInvalidIDs,
+		OKIDs:            okIDs,
+		FailedIDs:        failedIDs,
+		Page:             page,
+		PageSize:         pageSize,
+		Total:            total,
+		HasMore:          hasMore,
+		NextPage:         nextPage,
+	}, nil
+}
+
+func int8Ptr(i int8) *int8 { return &i }
 
 // BatchAssignProxy 批量设置账号代理。
 func (s *AccountAdminService) BatchAssignProxy(ctx context.Context, req *dto.AccountBatchAssignProxyReq) (*dto.AccountBatchAssignProxyResp, error) {
@@ -987,6 +1267,7 @@ func accountToResp(a *model.Account, _ *crypto.AESGCM) *dto.AccountResp {
 		SuccessCount:      a.SuccessCount,
 		HasRefreshToken:   len(a.RefreshTokenEnc) > 0,
 		HasAccessToken:    len(a.AccessTokenEnc) > 0,
+		HasSessionToken:   len(a.SessionTokenEnc) > 0,
 		LastTestStatus:    a.LastTestStatus,
 		LastTestLatencyMs: a.LastTestLatencyMs,
 		CreatedAt:         a.CreatedAt.Unix(),

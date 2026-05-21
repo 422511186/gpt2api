@@ -198,13 +198,14 @@ func (s *GenerationService) runTask(ctx context.Context, t *model.GenerationTask
 	var acc *model.Account
 	var res *provider.Result
 	var lastErr error
+	triedAccountIDs := make(map[uint64]struct{}, maxAttempts)
 	releaseAcc := func(a *model.Account) {
 		if a != nil {
 			s.pool.Release(a.ID)
 		}
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		picked, err := s.pickAccountForTask(ctx, t, params)
+		picked, err := s.pickAccountForTask(ctx, t, params, triedAccountIDs)
 		if err != nil {
 			if lastErr != nil {
 				s.failTask(ctx, t, fmt.Sprintf("provider call: %v", lastErr))
@@ -213,6 +214,7 @@ func (s *GenerationService) runTask(ctx context.Context, t *model.GenerationTask
 			}
 			return
 		}
+		triedAccountIDs[picked.ID] = struct{}{}
 		acc = picked
 		if err := s.repo.SetRunning(ctx, t.TaskID, acc.ID); err != nil {
 			log.Warn("set running failed", zap.Error(err))
@@ -262,6 +264,11 @@ func (s *GenerationService) runTask(ctx context.Context, t *model.GenerationTask
 				continue
 			}
 			provReq.Credential = cred
+			if st, serr := s.providerSessionToken(acc); serr == nil {
+				provReq.SessionToken = st
+			} else {
+				log.Warn("decrypt session token failed", zap.Uint64("account_id", acc.ID), zap.Error(serr))
+			}
 		}
 
 		rctx, cancel := context.WithTimeout(ctx, timeout)
@@ -274,6 +281,8 @@ func (s *GenerationService) runTask(ctx context.Context, t *model.GenerationTask
 		lastErr = err
 		if isUsageLimitReachedError(err) {
 			s.markProviderQuotaLimited(ctx, acc, err.Error(), usageLimitResetAt(err))
+		} else if isGPTWebInvalidAuthError(err) {
+			s.disableProviderAccount(ctx, acc, err.Error())
 		} else if isTransientProviderPathError(t.Provider, err) {
 			s.pool.MarkTransientFailed(ctx, acc.ID, err.Error())
 		} else {
@@ -412,21 +421,45 @@ func (s *GenerationService) providerCredential(ctx context.Context, acc *model.A
 	return cred, nil
 }
 
-func (s *GenerationService) pickAccountForTask(ctx context.Context, t *model.GenerationTask, params map[string]any) (*model.Account, error) {
+func (s *GenerationService) pickAccountForTask(ctx context.Context, t *model.GenerationTask, params map[string]any, triedAccountIDs map[uint64]struct{}) (*model.Account, error) {
 	if t == nil {
 		return nil, errcode.NoAvailableAcc
 	}
-	if t.Provider != model.ProviderGPT || t.Kind != string(provider.KindImage) || !strings.EqualFold(t.ModelCode, "gpt-image-2") {
-		return s.pool.ReserveWhere(ctx, t.Provider, "round_robin", nil)
-	}
-	if accountRequiresCodexRoute(t, params) {
-		return s.pool.ReserveWhere(ctx, t.Provider, "round_robin", isCodexOAuthAccount)
-	}
-	return s.pool.ReserveWhere(ctx, t.Provider, "round_robin", func(acc *model.Account) bool {
+	notTried := func(acc *model.Account) bool {
 		if acc == nil {
 			return false
 		}
-		return acc.AuthType == model.AuthTypeOAuth
+		if len(triedAccountIDs) == 0 {
+			return true
+		}
+		_, ok := triedAccountIDs[acc.ID]
+		return !ok
+	}
+	if t.Provider != model.ProviderGPT || t.Kind != string(provider.KindImage) || !strings.EqualFold(t.ModelCode, "gpt-image-2") {
+		return s.pool.ReserveWhere(ctx, t.Provider, "round_robin", notTried)
+	}
+	if accountRequiresCodexRoute(t, params) {
+		if acc, err := s.pool.ReserveWhere(ctx, t.Provider, "round_robin", func(acc *model.Account) bool {
+			return notTried(acc) && isCodexOAuthAccount(acc)
+		}); err == nil {
+			return acc, nil
+		}
+		return s.pool.ReserveWhere(ctx, t.Provider, "round_robin", func(acc *model.Account) bool {
+			return notTried(acc) && acc.AuthType == model.AuthTypeOAuth
+		})
+	}
+	if acc, err := s.pool.ReserveWhere(ctx, t.Provider, "round_robin", func(acc *model.Account) bool {
+		return notTried(acc) && acc.AuthType == model.AuthTypeOAuth && len(acc.SessionTokenEnc) > 0 && acc.ProxyID != nil
+	}); err == nil {
+		return acc, nil
+	}
+	if acc, err := s.pool.ReserveWhere(ctx, t.Provider, "round_robin", func(acc *model.Account) bool {
+		return notTried(acc) && acc.AuthType == model.AuthTypeOAuth && len(acc.SessionTokenEnc) > 0
+	}); err == nil {
+		return acc, nil
+	}
+	return s.pool.ReserveWhere(ctx, t.Provider, "round_robin", func(acc *model.Account) bool {
+		return notTried(acc) && acc.AuthType == model.AuthTypeOAuth
 	})
 }
 
@@ -504,7 +537,7 @@ func (s *GenerationService) disableProviderAccount(ctx context.Context, acc *mod
 	}
 	now := time.Now().UTC()
 	fields := map[string]any{
-		"status":           model.AccountStatusDisabled,
+		"status":           model.AccountStatusInvalid,
 		"last_error":       truncate(reason, 240),
 		"last_test_status": model.AccountTestFail,
 		"last_test_error":  truncate(reason, 240),
@@ -516,9 +549,9 @@ func (s *GenerationService) disableProviderAccount(ctx context.Context, acc *mod
 		logger.FromCtx(ctx).Warn("account.disable_failed", zap.Uint64("account_id", acc.ID), zap.Error(err))
 		return
 	}
-	acc.Status = model.AccountStatusDisabled
+	acc.Status = model.AccountStatusInvalid
 	s.pool.Reload(acc.Provider)
-	logger.FromCtx(ctx).Warn("account.disabled_after_oauth_refresh_401", zap.Uint64("account_id", acc.ID), zap.String("provider", acc.Provider), zap.String("reason", truncate(reason, 240)))
+	logger.FromCtx(ctx).Warn("account.marked_invalid_after_oauth_refresh_401", zap.Uint64("account_id", acc.ID), zap.String("provider", acc.Provider), zap.String("reason", truncate(reason, 240)))
 }
 
 func (s *GenerationService) markProviderQuotaLimited(ctx context.Context, acc *model.Account, reason string, until time.Time) {
@@ -688,6 +721,17 @@ func (s *GenerationService) gptOAuthAccessToken(ctx context.Context, acc *model.
 		acc.OAuthMeta = &raw
 	}
 	return strings.TrimSpace(tr.AccessToken), nil
+}
+
+func (s *GenerationService) providerSessionToken(acc *model.Account) (string, error) {
+	if acc == nil || len(acc.SessionTokenEnc) == 0 {
+		return "", nil
+	}
+	st, err := s.decryptOptional(acc.SessionTokenEnc)
+	if err != nil {
+		return "", fmt.Errorf("decrypt session_token failed: %w", err)
+	}
+	return st, nil
 }
 
 func (s *GenerationService) accessTokenShouldRefreshForCodex(acc *model.Account) bool {
@@ -1236,18 +1280,54 @@ func retryableProviderError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return isFatalOAuthRefreshError(err) ||
+		isGPTWebInvalidAuthError(err) ||
 		isUsageLimitReachedError(err) ||
 		strings.Contains(msg, "http 429") ||
 		strings.Contains(msg, "too many requests") ||
+		isGPTWebRetryableError(msg) ||
 		isGrokRetryableForbiddenError(msg)
 }
 
-func isTransientProviderPathError(provider string, err error) bool {
-	if err == nil || provider != model.ProviderGROK {
+func isGPTWebInvalidAuthError(err error) bool {
+	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "http 403") && isGrokRetryableForbiddenError(msg)
+	if !strings.Contains(msg, "gpt image2 web ") {
+		return false
+	}
+	return strings.Contains(msg, " 401") ||
+		strings.Contains(msg, "token_invalidated") ||
+		strings.Contains(msg, "please try signing in again") ||
+		strings.Contains(msg, "invalid_request_error")
+}
+
+func isTransientProviderPathError(provider string, err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if provider == model.ProviderGPT {
+		return isGPTWebRetryableError(msg)
+	}
+	return provider == model.ProviderGROK && strings.Contains(msg, "http 403") && isGrokRetryableForbiddenError(msg)
+}
+
+func isGPTWebRetryableError(msg string) bool {
+	if msg == "" {
+		return false
+	}
+	return strings.Contains(msg, "gpt image2 web bootstrap 403") ||
+		strings.Contains(msg, "gpt image2 web requirements 403") ||
+		strings.Contains(msg, "gpt image2 web prepare 403") ||
+		strings.Contains(msg, "gpt image2 web conversation 403") ||
+		strings.Contains(msg, "gpt image2 web bootstrap:") ||
+		strings.Contains(msg, "gpt image2 web requirements:") ||
+		strings.Contains(msg, "gpt image2 web prepare:") ||
+		strings.Contains(msg, "gpt image2 web conversation:") ||
+		strings.Contains(msg, "cloudflare") ||
+		strings.Contains(msg, "just a moment") ||
+		strings.Contains(msg, "connection refused")
 }
 
 func isGrokRetryableForbiddenError(msg string) bool {

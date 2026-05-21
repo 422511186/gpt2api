@@ -15,6 +15,7 @@ import {
   Tag,
   Ticket,
   UserCircle2,
+  UserPlus,
   Users,
   Wallet,
   WalletCards,
@@ -42,6 +43,7 @@ const NAV = [
   { to: '/recharge-packages', label: '充值套餐', icon: WalletCards },
   { to: '/model-prices', label: '模型价格', icon: BadgeDollarSign },
   { to: '/logs', label: '请求日志', icon: FileText },
+  { to: '/register', label: '注册管理', icon: UserPlus },
 ] as const;
 
 export function AdminLayout() {

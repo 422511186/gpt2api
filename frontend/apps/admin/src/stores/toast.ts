@@ -1,7 +1,7 @@
 // 极简 toast 通知 store（与用户端独立实例，避免跨 app 干扰）。
 import { create } from 'zustand';
 
-export type ToastKind = 'success' | 'error' | 'info';
+export type ToastKind = 'success' | 'error' | 'info' | 'warning';
 
 export interface Toast {
   id: number;
@@ -33,4 +33,5 @@ export const toast = {
   success: (msg: string) => useToastStore.getState().push('success', msg),
   error: (msg: string) => useToastStore.getState().push('error', msg),
   info: (msg: string) => useToastStore.getState().push('info', msg),
+  warning: (msg: string) => useToastStore.getState().push('warning', msg),
 };

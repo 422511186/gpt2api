@@ -74,6 +74,46 @@ func (s *AdminAuthService) Login(ctx context.Context, req *dto.LoginReq, ip stri
 	}, nil
 }
 
+// Refresh 用后台 refresh token 换新 access token。
+func (s *AdminAuthService) Refresh(ctx context.Context, refresh string) (*dto.TokenPair, error) {
+	cl, err := s.jwt.ParseRefresh(refresh)
+	if err != nil {
+		return nil, errcode.TokenExpired.Wrap(err)
+	}
+	if cl.Subject != jwtx.SubjectAdmin {
+		return nil, errcode.Unauthorized
+	}
+	u, err := s.repo.GetByID(ctx, cl.UID)
+	if err != nil {
+		return nil, errcode.UserNotFound
+	}
+	if !u.IsActive() {
+		return nil, errcode.Forbidden.WithMsg("账号已停用")
+	}
+	role, _ := s.repo.GetRoleByID(ctx, u.RoleID)
+	roles := []string{}
+	if role != nil {
+		roles = append(roles, role.Code)
+	}
+	jti := uuid.NewString()
+	access, accExp, err := s.jwt.IssueAccess(u.ID, jwtx.SubjectAdmin, jti, roles)
+	if err != nil {
+		return nil, errcode.Internal.Wrap(err)
+	}
+	nextRefresh, refExp, err := s.jwt.IssueRefresh(u.ID, jwtx.SubjectAdmin, jti)
+	if err != nil {
+		return nil, errcode.Internal.Wrap(err)
+	}
+	now := time.Now()
+	return &dto.TokenPair{
+		AccessToken:     access,
+		RefreshToken:    nextRefresh,
+		TokenType:       "Bearer",
+		AccessExpireIn:  int64(accExp.Sub(now).Seconds()),
+		RefreshExpireIn: int64(refExp.Sub(now).Seconds()),
+	}, nil
+}
+
 // ChangePassword updates the current admin user's password.
 func (s *AdminAuthService) ChangePassword(ctx context.Context, uid uint64, req *dto.ChangePasswordReq) error {
 	u, err := s.repo.GetByID(ctx, uid)

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Cloud, CreditCard, Database, RefreshCw, Save, ShieldAlert, Trash2 } from 'lucide-react';
+import { AlertTriangle, Cloud, CreditCard, Database, RefreshCw, Save, ShieldAlert, Trash2 } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 
 import { ApiError } from '../../lib/api';
@@ -36,6 +36,9 @@ interface FormState {
   alipay_private_key: string;
   wechat_mch_id: string;
   wechat_api_v3_key: string;
+  // 账号失效检测
+  account_invalid_check_enabled: boolean;
+  account_invalid_check_interval_seconds: number;
 }
 
 const DEFAULT_FORM: FormState = {
@@ -67,6 +70,9 @@ const DEFAULT_FORM: FormState = {
   alipay_private_key: '',
   wechat_mch_id: '',
   wechat_api_v3_key: '',
+  // 账号失效检测
+  account_invalid_check_enabled: false,
+  account_invalid_check_interval_seconds: 3600,
 };
 
 const asBool = (v: unknown, fallback = false) => (v == null ? fallback : Boolean(v));
@@ -107,6 +113,9 @@ function fromSettings(s: SystemSettings | undefined): FormState {
     alipay_private_key: asStr(s['payment.alipay_private_key']),
     wechat_mch_id: asStr(s['payment.wechat_mch_id']),
     wechat_api_v3_key: asStr(s['payment.wechat_api_v3_key']),
+    // 账号失效检测
+    account_invalid_check_enabled: asBool(s['account.invalid_check.enabled']),
+    account_invalid_check_interval_seconds: asNum(s['account.invalid_check.interval_seconds'], 3600),
   };
 }
 
@@ -140,6 +149,9 @@ function toPayload(f: FormState): Partial<SystemSettings> {
     'payment.alipay_private_key': f.alipay_private_key.trim(),
     'payment.wechat_mch_id': f.wechat_mch_id.trim(),
     'payment.wechat_api_v3_key': f.wechat_api_v3_key.trim(),
+    // 账号失效检测
+    'account.invalid_check.enabled': f.account_invalid_check_enabled,
+    'account.invalid_check.interval_seconds': Number(f.account_invalid_check_interval_seconds) || 3600,
   };
 }
 
@@ -255,6 +267,16 @@ export default function ConfigPage() {
                 <option value="off">不缓存</option>
               </select>
             </Field>
+          </Section>
+
+          <Section icon={<AlertTriangle size={18} />} title="账号失效检测" desc="后台定时检测账号有效性，自动标记失效（401 或明确凭证失效）的账号，403 仅记录失败。">
+            <Toggle label="启用后台定时检测" checked={form.account_invalid_check_enabled} onChange={(v) => set('account_invalid_check_enabled', v)} />
+            <NumberField label="检测间隔（秒）" value={form.account_invalid_check_interval_seconds} min={300} max={86400} onChange={(v) => set('account_invalid_check_interval_seconds', v)} />
+            {form.account_invalid_check_enabled && (
+              <div className="rounded-md border border-border bg-surface-2 p-3 text-small text-text-tertiary">
+                后台 worker 会每隔 {Math.floor(form.account_invalid_check_interval_seconds / 60)} 分钟检测所有启用的账号，发现 401 或明确凭证失效会自动标记为「失效」状态；403 通常是代理或风控问题，只记录失败。建议间隔 1-4 小时。
+              </div>
+            )}
           </Section>
 
           <Section icon={<Trash2 size={18} />} title="缓存清理" desc="查看并清理本地生成结果缓存，清理后旧作品可能无法继续预览原文件。">

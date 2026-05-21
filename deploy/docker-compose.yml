@@ -145,6 +145,21 @@ services:
         limits: { cpus: '2', memory: 1G }
     networks: [klein]
 
+  # Python 注册机服务
+  registrar:
+    image: kleinai/registrar:latest
+    build:
+      context: ../registrar
+      dockerfile: Dockerfile
+    container_name: klein-registrar
+    restart: always
+    expose: ["8080"]
+    volumes:
+      - klein-registrar-data:/app/data
+    environment:
+      TZ: Asia/Shanghai
+    networks: [klein]
+
   user-web:
     image: kleinai/user-web:latest
     build:
@@ -184,6 +199,7 @@ volumes:
   klein-mysql-data:
   klein-redis-data:
   klein-logs:
+  klein-registrar-data:
 
 networks:
   klein:

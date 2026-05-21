@@ -36,6 +36,11 @@ const (
 	SettingGrokCFBrowser       = "grok.cf.browser"
 	SettingGrokCFLastError     = "grok.cf.last_error"
 	SettingGrokCFLastRefreshAt = "grok.cf.last_refresh_at"
+	// 账号失效检测配置
+	SettingInvalidCheckEnabled    = "account.invalid_check.enabled"
+	SettingInvalidCheckInterval   = "account.invalid_check.interval_seconds"
+	SettingInvalidCheckLastRunAt  = "account.invalid_check.last_run_at"
+	SettingInvalidCheckLastResult = "account.invalid_check.last_result"
 )
 
 // SystemConfigService 通用系统配置 KV 服务，带 30s 内存缓存。
@@ -283,6 +288,23 @@ func (s *SystemConfigService) GrokCFTimeout(ctx context.Context) time.Duration {
 	}
 	if v > 300 {
 		v = 300
+	}
+	return time.Duration(v) * time.Second
+}
+
+// InvalidCheckEnabled 是否启用账号失效检测。
+func (s *SystemConfigService) InvalidCheckEnabled(ctx context.Context) bool {
+	return s.GetBool(ctx, SettingInvalidCheckEnabled, false)
+}
+
+// InvalidCheckInterval 账号失效检测间隔。
+func (s *SystemConfigService) InvalidCheckInterval(ctx context.Context) time.Duration {
+	v := s.GetInt(ctx, SettingInvalidCheckInterval, 3600) // 默认 1 小时
+	if v < 300 {
+		v = 300 // 最小 5 分钟
+	}
+	if v > 86400 {
+		v = 86400 // 最大 24 小时
 	}
 	return time.Duration(v) * time.Second
 }

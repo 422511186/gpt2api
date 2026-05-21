@@ -85,6 +85,7 @@ func collectFlexStrings(dst *[]string, v any) {
 
 type AccountTestService struct {
 	accountRepo *repo.AccountRepo
+	pool        *AccountPool
 	proxySvc    *ProxyService
 	cfgSvc      *SystemConfigService
 	openaiOAuth *OpenAIOAuthService
@@ -93,6 +94,7 @@ type AccountTestService struct {
 
 func NewAccountTestService(
 	r *repo.AccountRepo,
+	pool *AccountPool,
 	proxySvc *ProxyService,
 	cfgSvc *SystemConfigService,
 	openaiOAuth *OpenAIOAuthService,
@@ -100,6 +102,7 @@ func NewAccountTestService(
 ) *AccountTestService {
 	return &AccountTestService{
 		accountRepo: r,
+		pool:        pool,
 		proxySvc:    proxySvc,
 		cfgSvc:      cfgSvc,
 		openaiOAuth: openaiOAuth,
@@ -143,7 +146,7 @@ func (s *AccountTestService) decryptCredential(account *model.Account) (string, 
 	}
 	plain, err := s.aes.Decrypt(account.CredentialEnc)
 	if err != nil {
-		return "", fmt.Errorf("瑙ｅ瘑鍑瘉澶辫触: %w", err)
+		return "", fmt.Errorf("解密凭证失败: %w", err)
 	}
 	return strings.TrimSpace(string(plain)), nil
 }
@@ -168,6 +171,12 @@ func (s *AccountTestService) decryptSessionToken(account *model.Account) string 
 		return ""
 	}
 	return strings.TrimSpace(string(plain))
+}
+
+func (s *AccountTestService) poolReload(provider string) {
+	if s.pool != nil && provider != "" {
+		s.pool.Reload(provider)
+	}
 }
 
 func (s *AccountTestService) Test(ctx context.Context, account *model.Account) (*dto.AccountTestResp, error) {
@@ -206,7 +215,7 @@ func (s *AccountTestService) Test(ctx context.Context, account *model.Account) (
 	case model.ProviderGROK:
 		ok, errMsg, info = s.testGROK(ctx, account, proxyURL)
 	default:
-		return nil, errcode.InvalidParam.WithMsg("涓嶆敮鎸佺殑 provider: " + account.Provider)
+		return nil, errcode.InvalidParam.WithMsg("不支持的 provider: " + account.Provider)
 	}
 	latencyMs = int(time.Since(start) / time.Millisecond)
 
@@ -223,6 +232,15 @@ func (s *AccountTestService) Test(ctx context.Context, account *model.Account) (
 		"last_test_status":     st,
 		"last_test_latency_ms": latencyMs,
 		"last_test_error":      errMsg,
+	}
+	if ok {
+		updates["cooldown_until"] = nil
+		updates["last_error"] = nil
+		updates["error_count"] = 0
+		if account.Status == model.AccountStatusBroken || account.Status == model.AccountStatusInvalid {
+			updates["status"] = model.AccountStatusEnabled
+			defer s.poolReload(account.Provider)
+		}
 	}
 	if account.Provider == model.ProviderGROK && account.AuthType == model.AuthTypeCookie && ok {
 		updates["access_token_expires_at"] = now.Add(grokTokenTTL)
@@ -273,7 +291,7 @@ func (s *AccountTestService) testGPT(ctx context.Context, account *model.Account
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Sprintf("璇锋眰澶辫触: %v", err), nil
+		return false, fmt.Sprintf("请求失败: %v", err), nil
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
@@ -299,21 +317,21 @@ type accountTestInfo struct {
 func (s *AccountTestService) testOpenAIOAuth(ctx context.Context, account *model.Account, proxyURL string) (bool, string, *accountTestInfo) {
 	at, err := s.decryptAccessToken(account)
 	if err != nil {
-		return false, fmt.Sprintf("瑙ｅ瘑 access_token 澶辫触: %v", err), nil
+		return false, fmt.Sprintf("解密 access_token 失败: %v", err), nil
 	}
 	if at == "" {
-		return false, "OAuth 璐﹀彿鏈彇寰?access_token锛岃鍏堝埛鏂?RT", nil
+		return false, "OAuth 账号未取得 access_token，请先刷新 RT", nil
 	}
 	claims, ok := jwtpayload.ClaimsFromJWT(at)
 	if !ok {
-		return false, "access_token 涓嶆槸鍙В鏋愮殑 JWT", nil
+		return false, "access_token 不是可解析的 JWT", nil
 	}
 	exp, ok := jwtpayload.ExpUnixFromJWT(at)
 	if !ok {
-		return false, "access_token 缂哄皯 exp", nil
+		return false, "access_token 缺少 exp", nil
 	}
 	if time.Now().Unix() >= exp {
-		return false, "access_token 宸茶繃鏈燂紝璇峰埛鏂?RT", nil
+		return false, "access_token 已过期，请刷新 RT", nil
 	}
 	cid := accountOAuthClientID(account)
 	if cid == "" {
@@ -326,7 +344,7 @@ func (s *AccountTestService) testOpenAIOAuth(ctx context.Context, account *model
 	}
 	if _, ok := claims["https://api.openai.com/auth"]; !ok {
 		if _, ok := claims["https://api.openai.com/profile"]; !ok {
-			return false, "access_token 缂哄皯 OpenAI OAuth 鏉冮檺淇℃伅", nil
+			return false, "access_token 缺少 OpenAI OAuth 权限信息", nil
 		}
 	}
 
@@ -361,7 +379,7 @@ func (s *AccountTestService) probeChatGPTAccount(ctx context.Context, account *m
 	setChatGPTProbeHeaders(req, account, accessToken, cookieHeader)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("conversation/init 璇锋眰澶辫触: %w", err)
+		return nil, fmt.Errorf("conversation/init 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -612,7 +630,7 @@ func (s *AccountTestService) testGrokSSO(ctx context.Context, account *model.Acc
 	}
 	token := normalizeGrokSSOToken(cred)
 	if token == "" {
-		return nil, errors.New("Grok SSO token 涓虹┖")
+		return nil, errors.New("Grok SSO token 为空")
 	}
 	client, err := outbound.NewClient(outbound.Options{
 		ProxyURL: proxyURL,
@@ -701,20 +719,20 @@ func (s *AccountTestService) fetchGrokRateLimit(ctx context.Context, client *htt
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("rate-limits 璇锋眰澶辫触: %w", err)
+		return nil, fmt.Errorf("rate-limits 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode/100 != 2 {
 		msg := strings.TrimSpace(string(raw))
-		if isGrokInvalidCredential(msg) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return nil, fmt.Errorf("Grok token 鏃犳晥鎴栧凡杩囨湡: HTTP %d: %s", resp.StatusCode, trimMsg(msg, 200))
+		if isGrokInvalidCredential(msg) || resp.StatusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("Grok token 无效或已过期: HTTP %d: %s", resp.StatusCode, trimMsg(msg, 200))
 		}
 		return nil, fmt.Errorf("rate-limits HTTP %d: %s", resp.StatusCode, trimMsg(msg, 200))
 	}
 	var out grokRateLimitResp
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("rate-limits 鍝嶅簲瑙ｆ瀽澶辫触: %w", err)
+		return nil, fmt.Errorf("rate-limits 响应解析失败: %w", err)
 	}
 	return &out, nil
 }
@@ -776,10 +794,10 @@ func (s *AccountTestService) buildAuthHeader(account *model.Account) (string, er
 	case model.AuthTypeOAuth:
 		at, err := s.decryptAccessToken(account)
 		if err != nil {
-			return "", fmt.Errorf("瑙ｅ瘑 access_token 澶辫触: %w", err)
+			return "", fmt.Errorf("解密 access_token 失败: %w", err)
 		}
 		if at == "" {
-			return "", errors.New("OAuth 璐﹀彿鏈彇寰?access_token锛岃鍏堝埛鏂?RT")
+			return "", errors.New("OAuth 账号未取得 access_token，请先刷新 RT")
 		}
 		return "Bearer " + at, nil
 	case model.AuthTypeCookie:
@@ -789,7 +807,7 @@ func (s *AccountTestService) buildAuthHeader(account *model.Account) (string, er
 		}
 		return cred, nil
 	default:
-		return "", fmt.Errorf("鏈煡 auth_type: %s", account.AuthType)
+		return "", fmt.Errorf("未知 auth_type: %s", account.AuthType)
 	}
 }
 
@@ -814,11 +832,15 @@ func accountOAuthClientID(account *model.Account) string {
 }
 
 func (s *AccountTestService) RefreshOAuth(ctx context.Context, account *model.Account) (*dto.AccountRefreshResp, error) {
+	return s.refreshOAuth(ctx, account, "")
+}
+
+func (s *AccountTestService) refreshOAuth(ctx context.Context, account *model.Account, proxyURL string) (*dto.AccountRefreshResp, error) {
 	if !account.IsOAuth() {
-		return nil, errcode.InvalidParam.WithMsg("浠?OAuth 璐﹀彿鏀寔鍒锋柊 RT")
+		return nil, errcode.InvalidParam.WithMsg("仅 OAuth 账号支持刷新 RT")
 	}
 	if account.Provider != model.ProviderGPT {
-		return nil, errcode.InvalidParam.WithMsg("浠呮敮鎸?OpenAI / GPT 璐﹀彿鍒锋柊 RT")
+		return nil, errcode.InvalidParam.WithMsg("仅支持 OpenAI / GPT 账号刷新 RT")
 	}
 
 	rt := ""
@@ -837,12 +859,15 @@ func (s *AccountTestService) RefreshOAuth(ctx context.Context, account *model.Ac
 		rt = cred
 	}
 	if rt == "" {
-		return nil, errcode.InvalidParam.WithMsg("璐﹀彿鏈厤缃?refresh_token")
+		return nil, errcode.InvalidParam.WithMsg("账号未配置 refresh_token")
 	}
 
-	proxyURL, err := s.resolveProxyURL(ctx, account)
-	if err != nil {
-		return nil, errcode.Internal.Wrap(err)
+	if strings.TrimSpace(proxyURL) == "" {
+		resolvedProxyURL, err := s.resolveProxyURL(ctx, account)
+		if err != nil {
+			return nil, errcode.Internal.Wrap(err)
+		}
+		proxyURL = resolvedProxyURL
 	}
 
 	clientID, err := oauthRefreshClientID(account)
@@ -859,7 +884,7 @@ func (s *AccountTestService) RefreshOAuth(ctx context.Context, account *model.Ac
 			"last_error":  errMsg,
 			"error_count": gorm.Expr("error_count + 1"),
 		})
-		return nil, errcode.GPTUnavailable.Wrap(err).WithMsg("鍒锋柊澶辫触: " + err.Error())
+		return nil, errcode.GPTUnavailable.Wrap(err).WithMsg("刷新失败: " + err.Error())
 	}
 
 	atEnc, err := s.aes.Encrypt([]byte(tr.AccessToken))
@@ -908,13 +933,13 @@ func (s *AccountTestService) RefreshOAuth(ctx context.Context, account *model.Ac
 	}, nil
 }
 
-func (s *AccountTestService) maybeRefresh(ctx context.Context, account *model.Account, _ string) error {
+func (s *AccountTestService) maybeRefresh(ctx context.Context, account *model.Account, proxyURL string) error {
 	if !account.IsOAuth() || account.Provider != model.ProviderGPT {
 		return nil
 	}
 	at, _ := s.decryptAccessToken(account)
 	if at == "" {
-		_, err := s.RefreshOAuth(ctx, account)
+		_, err := s.refreshOAuth(ctx, account, proxyURL)
 		if err != nil {
 			return err
 		}
@@ -930,7 +955,7 @@ func (s *AccountTestService) maybeRefresh(ctx context.Context, account *model.Ac
 	hours := s.cfgSvc.RefreshBeforeHours(ctx)
 	threshold := time.Now().UTC().Add(time.Duration(hours) * time.Hour)
 	if account.AccessTokenExpiresAt.Before(threshold) {
-		_, err := s.RefreshOAuth(ctx, account)
+		_, err := s.refreshOAuth(ctx, account, proxyURL)
 		if err != nil {
 			return err
 		}
@@ -1047,4 +1072,250 @@ func accountTestImageResetAt(info *accountTestInfo) int64 {
 		return 0
 	}
 	return info.ImageQuotaResetAt
+}
+
+// AccountTestInvalidResp 检测账号有效性结果，包含是否应禁用的标志。
+type AccountTestInvalidResp struct {
+	OK            bool
+	Error         string
+	ShouldDisable bool // 是否应禁用账号（401 或明确凭证失效）
+	StatusCode    int
+}
+
+// TestWithInvalidCheck 测试账号有效性，并检查是否需要禁用账号。
+// 只有 401 或明确凭证失效错误会禁用账号；403 常见于代理/风控/Cloudflare，不自动禁用。
+func (s *AccountTestService) TestWithInvalidCheck(ctx context.Context, account *model.Account) (*AccountTestInvalidResp, error) {
+	proxyURL, err := s.resolveProxyURL(ctx, account)
+	if err != nil {
+		errMsg := "代理配置不可用: " + err.Error()
+		if len(errMsg) > 250 {
+			errMsg = errMsg[:250]
+		}
+		now := time.Now().UTC()
+		_ = s.accountRepo.Update(ctx, account.ID, map[string]any{
+			"last_test_at":         now,
+			"last_test_status":     model.AccountTestFail,
+			"last_test_latency_ms": 0,
+			"last_test_error":      errMsg,
+		})
+		return &AccountTestInvalidResp{OK: false, Error: errMsg, ShouldDisable: false}, nil
+	}
+
+	if account.IsOAuth() {
+		if err := s.maybeRefresh(ctx, account, proxyURL); err != nil {
+			fmt.Printf("[account-test-invalid] refresh failed: %v\n", err)
+		}
+	}
+
+	start := time.Now()
+	var (
+		ok         bool
+		errMsg     string
+		statusCode int
+	)
+	switch account.Provider {
+	case model.ProviderGPT:
+		ok, errMsg, statusCode = s.testGPTWithStatus(ctx, account, proxyURL)
+	case model.ProviderGROK:
+		ok, errMsg, statusCode = s.testGROKWithStatus(ctx, account, proxyURL)
+	default:
+		return nil, errcode.InvalidParam.WithMsg("unsupported provider: " + account.Provider)
+	}
+	latencyMs := int(time.Since(start) / time.Millisecond)
+
+	// 检查是否需要禁用账号
+	shouldDisable := false
+	if statusCode == http.StatusUnauthorized {
+		shouldDisable = true
+	} else if statusCode != http.StatusForbidden && isInvalidCredentialError(errMsg) {
+		shouldDisable = true
+	}
+
+	st := model.AccountTestFail
+	if ok {
+		st = model.AccountTestOK
+	}
+	if len(errMsg) > 250 {
+		errMsg = errMsg[:250]
+	}
+	now := time.Now().UTC()
+	updates := map[string]any{
+		"last_test_at":         now,
+		"last_test_status":     st,
+		"last_test_latency_ms": latencyMs,
+		"last_test_error":      errMsg,
+	}
+	if ok {
+		updates["cooldown_until"] = nil
+		updates["last_error"] = nil
+		updates["error_count"] = 0
+		if account.Status == model.AccountStatusBroken || account.Status == model.AccountStatusInvalid {
+			updates["status"] = model.AccountStatusEnabled
+			defer s.poolReload(account.Provider)
+		}
+	}
+	if account.Provider == model.ProviderGROK && account.AuthType == model.AuthTypeCookie && ok {
+		updates["access_token_expires_at"] = now.Add(grokTokenTTL)
+	}
+	if shouldDisable {
+		updates["last_error"] = errMsg
+	}
+	_ = s.accountRepo.Update(ctx, account.ID, updates)
+
+	return &AccountTestInvalidResp{
+		OK:            ok,
+		Error:         errMsg,
+		ShouldDisable: shouldDisable,
+		StatusCode:    statusCode,
+	}, nil
+}
+
+func isInvalidCredentialError(errMsg string) bool {
+	msg := strings.ToLower(errMsg)
+	markers := []string{
+		"invalid credential",
+		"invalid credentials",
+		"invalid api key",
+		"invalid_api_key",
+		"incorrect api key",
+		"token expired",
+		"token revoked",
+		"invalid-credentials",
+		"bad-credentials",
+		"session not found",
+		"account suspended",
+		"blocked-user",
+	}
+	for _, marker := range markers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func upstreamStatusCodeFromError(errMsg string) int {
+	msg := strings.ToLower(errMsg)
+	transportMarkers := []string{
+		"proxy connect",
+		"connect proxy",
+		"socks5 connect",
+		"request failed",
+		"tls handshake",
+		"read response failed",
+		"write request failed",
+	}
+	for _, marker := range transportMarkers {
+		if strings.Contains(msg, marker) {
+			return 0
+		}
+	}
+	switch {
+	case strings.Contains(msg, "http 401"):
+		return http.StatusUnauthorized
+	case strings.Contains(msg, "http 403"):
+		return http.StatusForbidden
+	default:
+		return 0
+	}
+}
+
+// testGPTWithStatus 测试 GPT 账号并返回 HTTP 状态码。
+func (s *AccountTestService) testGPTWithStatus(ctx context.Context, account *model.Account, proxyURL string) (bool, string, int) {
+	if account.AuthType == model.AuthTypeOAuth {
+		ok, errMsg, _ := s.testOpenAIOAuth(ctx, account, proxyURL)
+		return ok, errMsg, upstreamStatusCodeFromError(errMsg)
+	}
+
+	base := "https://api.openai.com"
+	if account.BaseURL != nil && *account.BaseURL != "" {
+		base = strings.TrimRight(*account.BaseURL, "/")
+	}
+	endpoint := base + "/v1/models"
+
+	authHeader, err := s.buildAuthHeader(account)
+	if err != nil {
+		return false, err.Error(), 0
+	}
+	client, err := outbound.NewClient(outbound.Options{
+		ProxyURL: proxyURL,
+		Timeout:  20 * time.Second,
+		Mode:     outbound.ModeUTLS,
+		Profile:  outbound.ProfileChrome,
+	})
+	if err != nil {
+		return false, err.Error(), 0
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, err.Error(), 0
+	}
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("request failed: %v", err), 0
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode/100 != 2 {
+		msg := strings.TrimSpace(string(body))
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		return false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, msg), resp.StatusCode
+	}
+	return true, "", resp.StatusCode
+}
+
+// testGROKWithStatus 测试 GROK 账号并返回 HTTP 状态码。
+func (s *AccountTestService) testGROKWithStatus(ctx context.Context, account *model.Account, proxyURL string) (bool, string, int) {
+	if account.AuthType == model.AuthTypeCookie {
+		_, err := s.testGrokSSO(ctx, account, proxyURL)
+		if err != nil {
+			errMsg := err.Error()
+			return false, errMsg, upstreamStatusCodeFromError(errMsg)
+		}
+		return true, "", 200
+	}
+
+	base := "https://api.x.ai"
+	if account.BaseURL != nil && *account.BaseURL != "" {
+		base = strings.TrimRight(*account.BaseURL, "/")
+	}
+	endpoint := base + "/v1/models"
+
+	cred, err := s.decryptCredential(account)
+	if err != nil {
+		return false, err.Error(), 0
+	}
+	client, err := outbound.NewClient(outbound.Options{
+		ProxyURL: proxyURL,
+		Timeout:  20 * time.Second,
+		Mode:     outbound.ModeUTLS,
+		Profile:  outbound.ProfileChrome,
+	})
+	if err != nil {
+		return false, err.Error(), 0
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, err.Error(), 0
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("request failed: %v", err), 0
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode/100 != 2 {
+		msg := strings.TrimSpace(string(body))
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		return false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, msg), resp.StatusCode
+	}
+	return true, "", resp.StatusCode
 }

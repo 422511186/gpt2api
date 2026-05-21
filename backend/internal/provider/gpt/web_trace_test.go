@@ -151,3 +151,44 @@ func TestExtractWebImageDirectURLsIgnoresChatGPTStaticAssets(t *testing.T) {
 		t.Fatalf("expected only generated asset URL, got %#v", urls)
 	}
 }
+
+func TestWebConversationPayloadKeepsRootAndPrompt(t *testing.T) {
+	const prompt = "一只白色机器人在雨夜读书"
+
+	prepare := webPrepareImageConversationBody("gpt-5-5-thinking")
+	if prepare["parent_message_id"] != "client-created-root" {
+		t.Fatalf("prepare parent_message_id = %#v", prepare["parent_message_id"])
+	}
+	if prepare["client_prepare_state"] != "none" {
+		t.Fatalf("prepare client_prepare_state = %#v", prepare["client_prepare_state"])
+	}
+	if _, ok := prepare["partial_query"]; ok {
+		t.Fatalf("prepare should not carry partial_query")
+	}
+	if prepare["thinking_effort"] != "standard" {
+		t.Fatalf("prepare thinking_effort = %#v", prepare["thinking_effort"])
+	}
+
+	conversation := webStartImageGenerationBody(prompt, "gpt-5-5-thinking", nil)
+	if conversation["parent_message_id"] != "client-created-root" {
+		t.Fatalf("conversation parent_message_id = %#v", conversation["parent_message_id"])
+	}
+	if conversation["client_prepare_state"] != "success" {
+		t.Fatalf("conversation client_prepare_state = %#v", conversation["client_prepare_state"])
+	}
+	if conversation["thinking_effort"] != "standard" {
+		t.Fatalf("conversation thinking_effort = %#v", conversation["thinking_effort"])
+	}
+	messages, ok := conversation["messages"].([]map[string]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("unexpected messages: %#v", conversation["messages"])
+	}
+	content, ok := messages[0]["content"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected content: %#v", messages[0]["content"])
+	}
+	parts, ok := content["parts"].([]string)
+	if !ok || len(parts) != 1 || parts[0] != prompt {
+		t.Fatalf("prompt parts = %#v", content["parts"])
+	}
+}

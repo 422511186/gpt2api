@@ -55,7 +55,7 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 	sysCfgSvc := service.NewSystemConfigService(sysCfgRepo)
 	proxySvc := service.NewProxyService(proxyRepo, deps.AES)
 	openaiOAuth := service.NewOpenAIOAuthService(sysCfgSvc)
-	accountTest := service.NewAccountTestService(accountRepo, proxySvc, sysCfgSvc, openaiOAuth, deps.AES)
+	accountTest := service.NewAccountTestService(accountRepo, pool, proxySvc, sysCfgSvc, openaiOAuth, deps.AES)
 	// 把测试服务注入 AccountAdminService，使 Test/Refresh/BatchRefresh 走得通。
 	accountAdmin.SetTestService(accountTest)
 
@@ -71,12 +71,18 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 	logH := handler.NewAdminLogHandler(generationRepo, accountRepo, deps.AES)
 	dashboardH := handler.NewAdminDashboardHandler(dashboardRepo)
 
+	// === register service ===
+	// 使用代理模式，转发到 Python registrar 服务
+	registrarURL := "http://klein-registrar:8080" // Python registrar 服务地址
+	registerProxyH := handler.NewRegisterProxyHandler(registrarURL)
+
 	// auth 公开
 	auth := v1.Group("/auth")
 	if deps.Limiter != nil {
 		auth.Use(middleware.RateLimitIP(deps.Limiter, 30))
 	}
 	auth.POST("/login", authH.Login)
+	auth.POST("/refresh", authH.Refresh)
 	v1.GET("/logs/generations/:task_id/preview", logH.GenerationPreview)
 
 	// 登录后接口
@@ -101,10 +107,12 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 			acc.POST("", accountH.Create)
 			acc.POST("/import", accountH.BatchImport)
 			acc.POST("/batch-delete", accountH.BatchDelete)
+			acc.POST("/batch-status", accountH.BatchStatus)
 			acc.POST("/batch-assign-proxy", accountH.BatchAssignProxy)
 			acc.POST("/purge", accountH.Purge)
 			acc.POST("/batch-refresh", accountH.BatchRefresh)
 			acc.POST("/batch-probe", accountH.BatchProbeQuota)
+			acc.POST("/batch-check-invalid", accountH.BatchCheckInvalid)
 			acc.GET("/stats", accountH.PoolStats)
 			acc.PUT("/:id", accountH.Update)
 			acc.DELETE("/:id", accountH.Delete)
@@ -159,7 +167,20 @@ func MountAdmin(r *gin.Engine, deps *bootstrap.Deps) *service.AccountPool {
 			logs.GET("/generations/:task_id/upstream", logH.GenerationUpstreamLogs)
 			logs.DELETE("/generations", logH.PurgeGenerationLogs)
 		}
+
+		// 注册机管理 - 代理到 Python registrar 服务
+		reg := authed.Group("/register")
+		{
+			reg.GET("", registerProxyH.GetConfig)
+			reg.POST("", registerProxyH.UpdateConfig)
+			reg.POST("/start", registerProxyH.Start)
+			reg.POST("/stop", registerProxyH.Stop)
+			reg.POST("/reset", registerProxyH.Reset)
+		}
 	}
+
+	// SSE 事件流：使用 AuthJWTOrQuery 以支持 EventSource 无法设置 header 的场景
+	v1.GET("/register/events", middleware.AuthJWTOrQuery(deps.JWT, jwtx.SubjectAdmin), registerProxyH.Events)
 
 	return pool
 }

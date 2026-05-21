@@ -126,8 +126,10 @@ func (h *AdminAccountHandler) BatchImport(c *gin.Context) {
 		}
 	case "lines":
 		// ok
+	case "session_tokens":
+		// ok - 批量导入 session token
 	default:
-		response.Fail(c, errcode.InvalidParam.WithMsg("format 仅支持 lines / sub2api"))
+		response.Fail(c, errcode.InvalidParam.WithMsg("format 仅支持 lines / sub2api / session_tokens"))
 		return
 	}
 	uid := middleware.UID(c)
@@ -152,6 +154,21 @@ func (h *AdminAccountHandler) BatchDelete(c *gin.Context) {
 		return
 	}
 	response.OK(c, dto.AccountBulkOpResult{Deleted: n})
+}
+
+// BatchStatus POST /admin/api/v1/accounts/batch-status
+func (h *AdminAccountHandler) BatchStatus(c *gin.Context) {
+	var req dto.AccountBatchStatusReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, errcode.InvalidParam.Wrap(err))
+		return
+	}
+	res, err := h.svc.BatchUpdateStatus(c.Request.Context(), &req)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, res)
 }
 
 // BatchAssignProxy POST /admin/api/v1/accounts/batch-assign-proxy
@@ -186,7 +203,12 @@ func (h *AdminAccountHandler) Purge(c *gin.Context) {
 
 // PoolStats GET /admin/api/v1/accounts/stats
 func (h *AdminAccountHandler) PoolStats(c *gin.Context) {
-	response.OK(c, gin.H{"pool": h.pool.Stats()})
+	stats, err := h.svc.PoolStats(c.Request.Context())
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, stats)
 }
 
 // Test POST /admin/api/v1/accounts/:id/test
@@ -262,6 +284,23 @@ func (h *AdminAccountHandler) BatchProbeQuota(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&body)
 	res, err := h.svc.BatchProbeQuota(c.Request.Context(), body.Provider, body.Page, body.PageSize)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, res)
+}
+
+// BatchCheckInvalid POST /admin/api/v1/accounts/batch-check-invalid
+// 检测账号有效性，自动禁用 401 或明确凭证失效的账号；403 只记为检测失败。
+func (h *AdminAccountHandler) BatchCheckInvalid(c *gin.Context) {
+	var body struct {
+		Provider string `json:"provider"`
+		Page     int    `json:"page"`
+		PageSize int    `json:"page_size"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	res, err := h.svc.BatchCheckInvalid(c.Request.Context(), body.Provider, body.Page, body.PageSize)
 	if err != nil {
 		response.Fail(c, err)
 		return

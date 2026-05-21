@@ -7,6 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/kleinai/backend/internal/dto"
 	"github.com/kleinai/backend/internal/model"
 )
 
@@ -85,6 +86,30 @@ func (r *AccountRepo) List(ctx context.Context, f AccountListFilter) ([]*model.A
 	return items, total, nil
 }
 
+// ProviderStats 按 provider 聚合账号数量与已探测额度。
+func (r *AccountRepo) ProviderStats(ctx context.Context) ([]dto.AccountProviderStatsResp, error) {
+	rows := []dto.AccountProviderStatsResp{}
+	sql := `SELECT
+  provider,
+  COUNT(1) AS total,
+  COALESCE(SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END), 0) AS enabled,
+  COALESCE(SUM(CASE WHEN status = 1 AND (cooldown_until IS NULL OR cooldown_until <= UTC_TIMESTAMP()) THEN 1 ELSE 0 END), 0) AS available,
+  COALESCE(SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END), 0) AS broken,
+  COALESCE(SUM(CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(oauth_meta, '$.image_quota_remaining')), '0') AS SIGNED)), 0) AS quota_remaining,
+  COALESCE(SUM(CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(oauth_meta, '$.image_quota_total')), '0') AS SIGNED)), 0) AS quota_total
+FROM account
+WHERE deleted_at IS NULL
+GROUP BY provider
+ORDER BY provider ASC`
+	if err := r.db.WithContext(ctx).Raw(sql).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		rows[i].TotalQuota = rows[i].QuotaRemaining
+	}
+	return rows, nil
+}
+
 // Update 部分字段更新。
 func (r *AccountRepo) Update(ctx context.Context, id uint64, fields map[string]any) error {
 	if len(fields) == 0 {
@@ -112,12 +137,12 @@ func (r *AccountRepo) SoftDeleteMany(ctx context.Context, ids []uint64) (int64, 
 	return res.RowsAffected, res.Error
 }
 
-// SoftDeleteInvalid 软删：已禁用、熔断、或最近连通测试失败。
+// SoftDeleteInvalid 软删：已禁用、熔断、失效、或最近连通测试失败。
 func (r *AccountRepo) SoftDeleteInvalid(ctx context.Context, provider string) (int64, error) {
 	now := time.Now().UTC()
 	q := r.db.WithContext(ctx).Model(&model.Account{}).Where("deleted_at IS NULL").
-		Where("(last_test_status = ? OR status IN (?, ?))",
-			model.AccountTestFail, model.AccountStatusDisabled, model.AccountStatusBroken)
+		Where("(last_test_status = ? OR status IN (?, ?, ?))",
+			model.AccountTestFail, model.AccountStatusDisabled, model.AccountStatusBroken, model.AccountStatusInvalid)
 	if provider != "" {
 		q = q.Where("provider = ?", provider)
 	}

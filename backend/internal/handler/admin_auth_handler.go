@@ -44,6 +44,21 @@ func (h *AdminAuthHandler) Login(c *gin.Context) {
 	})
 }
 
+// Refresh POST /admin/api/v1/auth/refresh
+func (h *AdminAuthHandler) Refresh(c *gin.Context) {
+	var req dto.RefreshReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, errcode.InvalidParam.Wrap(err))
+		return
+	}
+	tok, err := h.auth.Refresh(c.Request.Context(), req.RefreshToken)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{"token": tok})
+}
+
 // Me GET /admin/api/v1/auth/me
 func (h *AdminAuthHandler) Me(c *gin.Context) {
 	uid := middleware.MustUID(c)

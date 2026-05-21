@@ -27,6 +27,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,11 +39,13 @@ import (
 	"github.com/kleinai/backend/internal/provider"
 	"github.com/kleinai/backend/pkg/outbound"
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
-	defaultBaseURL = "https://api.openai.com"
-	defaultTimeout = 6 * time.Minute
+	defaultBaseURL         = "https://api.openai.com"
+	defaultTimeout         = 6 * time.Minute
+	defaultFlareSolverrURL = "http://flaresolverr:8191"
 )
 
 // Provider 实现 provider.Provider。
@@ -255,6 +258,19 @@ type webUploadMeta struct {
 	Height        int
 }
 
+type webBootstrapResult struct {
+	Status          int
+	Error           string
+	HasSessionToken bool
+}
+
+type webCFResult struct {
+	Status    int
+	Cookies   int
+	UserAgent string
+	Error     string
+}
+
 func (p *Provider) generateImage2Web(ctx context.Context, req *provider.Request) (*provider.Result, error) {
 	base := strings.TrimRight(req.BaseURL, "/")
 	if base == "" || isCodexBase(base) || strings.Contains(base, "api.openai.com") {
@@ -268,26 +284,44 @@ func (p *Provider) generateImage2Web(ctx context.Context, req *provider.Request)
 	ratio := webRatioFromSize(size, strParam(req.Params, "ratio", strParam(req.Params, "aspect_ratio", "1:1")))
 	prompt := webImagePromptV2(req.Prompt, ratio, size)
 	webModel := webImageModelSlug(req)
-	client, err := p.httpClient(req.ProxyURL)
+	client, err := p.webHTTPClient(req.ProxyURL)
 	if err != nil {
 		return nil, err
 	}
 	fp := newWebFP()
+	cf := p.webCloudflareCookies(ctx, client, base, req.ProxyURL)
+	if cf.UserAgent != "" {
+		fp.UserAgent = cf.UserAgent
+	}
+	hasSessionToken := strings.TrimSpace(req.SessionToken) != ""
 	start := time.Now()
 	logUpstream(ctx, req, provider.UpstreamLogEntry{
 		Provider: "gpt",
 		Stage:    "web.start",
 		Meta: map[string]any{
-			"route":     "chatgpt_web",
-			"model":     webModel,
-			"ratio":     ratio,
-			"count":     count,
-			"ref_count": len(req.RefAssets),
+			"route":             "chatgpt_web",
+			"model":             webModel,
+			"ratio":             ratio,
+			"count":             count,
+			"ref_count":         len(req.RefAssets),
+			"has_session_token": hasSessionToken,
 		},
 	})
-	if err := p.webBootstrap(ctx, client, base, fp); err != nil {
-		logUpstream(ctx, req, provider.UpstreamLogEntry{Provider: "gpt", Stage: "web.bootstrap", Method: "GET", URL: base + "/", Error: err.Error()})
-		return nil, err
+	cfMeta := map[string]any{"status": cf.Status, "cookies": cf.Cookies, "has_user_agent": cf.UserAgent != ""}
+	if cf.Error != "" {
+		logUpstream(ctx, req, provider.UpstreamLogEntry{Provider: "gpt", Stage: "web.cf", Method: "POST", URL: webFlareSolverrURL(), Error: cf.Error, Meta: cfMeta})
+	} else if cf.Cookies > 0 {
+		logUpstream(ctx, req, provider.UpstreamLogEntry{Provider: "gpt", Stage: "web.cf", Method: "POST", URL: webFlareSolverrURL(), Meta: cfMeta})
+	}
+	bootstrap := p.webBootstrap(ctx, client, base, fp, req.SessionToken)
+	bootstrapMeta := map[string]any{
+		"has_session_token": bootstrap.HasSessionToken,
+		"status":            bootstrap.Status,
+	}
+	if bootstrap.Error != "" {
+		logUpstream(ctx, req, provider.UpstreamLogEntry{Provider: "gpt", Stage: "web.bootstrap", Method: "GET", URL: base + "/", Error: bootstrap.Error, Meta: bootstrapMeta})
+	} else {
+		logUpstream(ctx, req, provider.UpstreamLogEntry{Provider: "gpt", Stage: "web.bootstrap", Method: "GET", URL: base + "/", Meta: bootstrapMeta})
 	}
 	reqs, err := p.webRequirements(ctx, client, base, fp, req.Credential)
 	if err != nil {
@@ -774,26 +808,130 @@ func newWebFP() webFP {
 	}
 }
 
-func (p *Provider) webBootstrap(ctx context.Context, client *http.Client, base string, fp webFP) error {
+func (p *Provider) webBootstrap(ctx context.Context, client *http.Client, base string, fp webFP, sessionToken string) webBootstrapResult {
+	hasSessionToken := seedWebSessionCookie(client, base, sessionToken)
+	result := webBootstrapResult{HasSessionToken: hasSessionToken}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/", nil)
 	if err != nil {
-		return err
+		result.Error = err.Error()
+		return result
 	}
-	for k, v := range webBaseHeaders(fp, "", "") {
+	for k, v := range webBootstrapHeaders(fp) {
 		httpReq.Header.Set(k, v)
 	}
-	httpReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("gpt image2 web bootstrap: %w", err)
+		result.Error = fmt.Sprintf("gpt image2 web bootstrap: %v", err)
+		return result
 	}
 	defer resp.Body.Close()
+	result.Status = resp.StatusCode
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 320))
-		return fmt.Errorf("gpt image2 web bootstrap %d: %s", resp.StatusCode, string(raw))
+		result.Error = fmt.Sprintf("gpt image2 web bootstrap %d (has_session_token=%t): %s", resp.StatusCode, hasSessionToken, string(raw))
+		return result
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
-	return nil
+	return result
+}
+
+func (p *Provider) webCloudflareCookies(ctx context.Context, client *http.Client, base, proxyURL string) webCFResult {
+	result := webCFResult{}
+	if client == nil || client.Jar == nil {
+		return result
+	}
+	solverURL := webFlareSolverrURL()
+	if solverURL == "" {
+		return result
+	}
+	body := map[string]any{
+		"cmd":        "request.get",
+		"url":        strings.TrimRight(base, "/"),
+		"maxTimeout": 120000,
+	}
+	if strings.TrimSpace(proxyURL) != "" {
+		body["proxy"] = map[string]string{"url": strings.TrimSpace(proxyURL)}
+	}
+	payload, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, solverURL+"/v1", bytes.NewReader(payload))
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	req.Header.Set("Content-Type", "application/json")
+	fsClient := &http.Client{Timeout: 150 * time.Second}
+	resp, err := fsClient.Do(req)
+	if err != nil {
+		result.Error = fmt.Sprintf("flaresolverr request: %v", err)
+		return result
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Status   string `json:"status"`
+		Message  string `json:"message"`
+		Solution struct {
+			Status    int    `json:"status"`
+			UserAgent string `json:"userAgent"`
+			Cookies   []struct {
+				Name     string  `json:"name"`
+				Value    string  `json:"value"`
+				Domain   string  `json:"domain"`
+				Path     string  `json:"path"`
+				Secure   bool    `json:"secure"`
+				HttpOnly bool    `json:"httpOnly"`
+				Expiry   float64 `json:"expiry"`
+			} `json:"cookies"`
+		} `json:"solution"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&out); err != nil {
+		result.Error = fmt.Sprintf("decode flaresolverr: %v", err)
+		return result
+	}
+	result.Status = out.Solution.Status
+	if resp.StatusCode >= 400 || out.Status != "ok" {
+		msg := out.Message
+		if msg == "" {
+			msg = resp.Status
+		}
+		result.Error = fmt.Sprintf("flaresolverr %s: %s", out.Status, msg)
+		return result
+	}
+	u, err := url.Parse(strings.TrimRight(base, "/"))
+	if err != nil || u.Host == "" {
+		result.Error = "invalid web base url"
+		return result
+	}
+	if u.Scheme == "" {
+		u.Scheme = "https"
+	}
+	cookies := make([]*http.Cookie, 0, len(out.Solution.Cookies))
+	for _, c := range out.Solution.Cookies {
+		name := strings.TrimSpace(c.Name)
+		value := strings.TrimSpace(c.Value)
+		if name == "" || value == "" {
+			continue
+		}
+		path := c.Path
+		if path == "" {
+			path = "/"
+		}
+		cookie := &http.Cookie{
+			Name:     name,
+			Value:    value,
+			Path:     path,
+			Domain:   c.Domain,
+			Secure:   c.Secure,
+			HttpOnly: c.HttpOnly,
+		}
+		if c.Expiry > 0 {
+			cookie.Expires = time.Unix(int64(c.Expiry), 0)
+		}
+		cookies = append(cookies, cookie)
+	}
+	client.Jar.SetCookies(u, cookies)
+	result.Cookies = len(cookies)
+	result.UserAgent = strings.TrimSpace(out.Solution.UserAgent)
+	return result
 }
 
 func (p *Provider) webRequirements(ctx context.Context, client *http.Client, base string, fp webFP, token string) (webRequirement, error) {
@@ -847,22 +985,7 @@ func (p *Provider) webRequirements(ctx context.Context, client *http.Client, bas
 
 func (p *Provider) webPrepareImageConversation(ctx context.Context, client *http.Client, base string, fp webFP, token string, reqs webRequirement, prompt, modelSlug string, refs []webUploadMeta) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
-	body := map[string]any{
-		"action":                 "next",
-		"fork_from_shared_post":  false,
-		"parent_message_id":      "client-created-root",
-		"model":                  modelSlug,
-		"client_prepare_state":   "none",
-		"timezone_offset_min":    -480,
-		"timezone":               "Asia/Shanghai",
-		"conversation_mode":      map[string]any{"kind": "primary_assistant"},
-		"system_hints":           []string{"picture_v2"},
-		"attachment_mime_types":  []string{"image/png"},
-		"supports_buffering":     true,
-		"supported_encodings":    []string{"v1"},
-		"client_contextual_info": map[string]any{"app_name": "chatgpt.com"},
-		"thinking_effort":        "standard",
-	}
+	body := webPrepareImageConversationBody(modelSlug)
 	payload, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(payload))
 	if err != nil {
@@ -894,9 +1017,54 @@ func (p *Provider) webPrepareImageConversation(ctx context.Context, client *http
 
 func (p *Provider) webStartImageGeneration(ctx context.Context, client *http.Client, base string, fp webFP, token string, reqs webRequirement, conduit, prompt, modelSlug string, refs []webUploadMeta) (string, []string, []string, []string, string, error) {
 	path := "/backend-api/f/conversation"
+	body := webStartImageGenerationBody(prompt, modelSlug, refs)
+	payload, _ := json.Marshal(body)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(payload))
+	if err != nil {
+		return "", nil, nil, nil, "", err
+	}
+	for k, v := range webImageHeaders(fp, token, path, reqs, conduit, "text/event-stream") {
+		httpReq.Header.Set(k, v)
+	}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", nil, nil, nil, "", fmt.Errorf("gpt image2 web conversation: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", nil, nil, nil, "", fmt.Errorf("gpt image2 web conversation %d: %s", resp.StatusCode, snippet(raw, 320))
+	}
+	conversationID, fileIDs, sedimentIDs, directURLs, lastText, err := parseWebImageSSE(resp.Body)
+	if err != nil {
+		return "", nil, nil, nil, "", err
+	}
+	return conversationID, fileIDs, sedimentIDs, directURLs, lastText, nil
+}
+
+func webPrepareImageConversationBody(modelSlug string) map[string]any {
+	return map[string]any{
+		"action":                 "next",
+		"fork_from_shared_post":  false,
+		"parent_message_id":      "client-created-root",
+		"model":                  modelSlug,
+		"client_prepare_state":   "none",
+		"timezone_offset_min":    -480,
+		"timezone":               "Asia/Shanghai",
+		"conversation_mode":      map[string]any{"kind": "primary_assistant"},
+		"system_hints":           []string{"picture_v2"},
+		"attachment_mime_types":  []string{"image/png"},
+		"supports_buffering":     true,
+		"supported_encodings":    []string{"v1"},
+		"client_contextual_info": map[string]any{"app_name": "chatgpt.com"},
+		"thinking_effort":        "standard",
+	}
+}
+
+func webStartImageGenerationBody(prompt, modelSlug string, refs []webUploadMeta) map[string]any {
 	content, metadata := webImageMessageContent(prompt, refs)
 	messageID := uuid.NewString()
-	body := map[string]any{
+	return map[string]any{
 		"action":                   "next",
 		"fork_from_shared_post":    false,
 		"parent_message_id":        "client-created-root",
@@ -924,28 +1092,6 @@ func (p *Provider) webStartImageGeneration(ctx context.Context, client *http.Cli
 			"metadata":    metadata,
 		}},
 	}
-	payload, _ := json.Marshal(body)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(payload))
-	if err != nil {
-		return "", nil, nil, nil, "", err
-	}
-	for k, v := range webImageHeaders(fp, token, path, reqs, conduit, "text/event-stream") {
-		httpReq.Header.Set(k, v)
-	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return "", nil, nil, nil, "", fmt.Errorf("gpt image2 web conversation: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(resp.Body)
-		return "", nil, nil, nil, "", fmt.Errorf("gpt image2 web conversation %d: %s", resp.StatusCode, snippet(raw, 320))
-	}
-	conversationID, fileIDs, sedimentIDs, directURLs, lastText, err := parseWebImageSSE(resp.Body)
-	if err != nil {
-		return "", nil, nil, nil, "", err
-	}
-	return conversationID, fileIDs, sedimentIDs, directURLs, lastText, nil
 }
 
 func webImageMessageContent(prompt string, refs []webUploadMeta) (map[string]any, map[string]any) {
@@ -1397,6 +1543,60 @@ func (p *Provider) httpClient(proxyURL string) (*http.Client, error) {
 	})
 }
 
+func (p *Provider) webHTTPClient(proxyURL string) (*http.Client, error) {
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return nil, err
+	}
+	client, err := outbound.NewClient(outbound.Options{
+		ProxyURL: proxyURL,
+		Timeout:  defaultTimeout,
+		Mode:     outbound.ModeUTLS,
+		Profile:  outbound.ProfileChrome,
+	})
+	if err != nil {
+		return nil, err
+	}
+	client.Jar = jar
+	return client, nil
+}
+
+func seedWebSessionCookie(client *http.Client, base, sessionToken string) bool {
+	sessionToken = strings.TrimSpace(sessionToken)
+	if client == nil || client.Jar == nil || sessionToken == "" {
+		return false
+	}
+	u, err := url.Parse(strings.TrimRight(base, "/"))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme == "" {
+		u.Scheme = "https"
+	}
+	client.Jar.SetCookies(u, []*http.Cookie{{
+		Name:     "__Secure-next-auth.session-token",
+		Value:    sessionToken,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+	}})
+	return true
+}
+
+func webFlareSolverrURL() string {
+	v := strings.TrimSpace(os.Getenv("KLEIN_GPT_WEB_FLARESOLVERR_URL"))
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("KLEIN_GROK_CF_SOLVER_URL"))
+	}
+	if v == "" {
+		v = defaultFlareSolverrURL
+	}
+	if strings.EqualFold(v, "off") || strings.EqualFold(v, "false") || strings.EqualFold(v, "none") {
+		return ""
+	}
+	return strings.TrimRight(v, "/")
+}
+
 func firstStringParam(p map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if v := strParam(p, key, ""); v != "" {
@@ -1604,6 +1804,29 @@ func webBaseHeaders(fp webFP, token, path string) map[string]string {
 		h["Authorization"] = "Bearer " + token
 	}
 	return h
+}
+
+func webBootstrapHeaders(fp webFP) map[string]string {
+	return map[string]string{
+		"User-Agent":                 fp.UserAgent,
+		"Accept":                     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"Accept-Language":            "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+		"Cache-Control":              "no-cache",
+		"Pragma":                     "no-cache",
+		"Priority":                   "u=1, i",
+		"Sec-Ch-Ua":                  fp.SecCHUA,
+		"Sec-Ch-Ua-Arch":             `"x86"`,
+		"Sec-Ch-Ua-Bitness":          `"64"`,
+		"Sec-Ch-Ua-Mobile":           "?0",
+		"Sec-Ch-Ua-Model":            `""`,
+		"Sec-Ch-Ua-Platform":         `"Windows"`,
+		"Sec-Ch-Ua-Platform-Version": `"19.0.0"`,
+		"Sec-Fetch-Dest":             "document",
+		"Sec-Fetch-Mode":             "navigate",
+		"Sec-Fetch-Site":             "none",
+		"Sec-Fetch-User":             "?1",
+		"Upgrade-Insecure-Requests":  "1",
+	}
 }
 
 func webImageHeaders(fp webFP, token, path string, reqs webRequirement, conduit, accept string) map[string]string {

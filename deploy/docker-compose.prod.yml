@@ -1,0 +1,285 @@
+# ==============================================
+#   KleinAI 生产部署配置（带资源限制）
+#   启动: docker compose up -d
+# ==============================================
+
+x-backend-env: &backend-env
+  KLEIN_ENV: prod
+  KLEIN_DB_DSN: klein:${KLEIN_MYSQL_PASSWORD:-change-me-mysql-password}@tcp(mysql:3306)/klein_ai?charset=utf8mb4&parseTime=True&loc=Local
+  KLEIN_REDIS_ADDR: redis:6379
+  KLEIN_REDIS_PASSWORD: ""
+  KLEIN_REDIS_DB: "0"
+  KLEIN_JWT_SECRET: ${KLEIN_JWT_SECRET:-change-me-jwt-secret-32bytes}
+  KLEIN_JWT_REFRESH_SECRET: ${KLEIN_JWT_REFRESH_SECRET:-change-me-refresh-secret-32bytes}
+  KLEIN_JWT_ACCESS_TTL: 2h
+  KLEIN_JWT_REFRESH_TTL: 336h
+  KLEIN_AES_KEY: ${KLEIN_AES_KEY:-00000000000000000000000000000000}
+  KLEIN_PROVIDER_GPT: real
+  KLEIN_PROVIDER_GROK: real
+  KLEIN_OPENAI_BASE: https://api.openai.com
+  KLEIN_GROK_BASE: https://api.x.ai
+  KLEIN_GPT_BASE_URL: https://api.openai.com
+  KLEIN_GROK_BASE_URL: https://grok.com
+  KLEIN_GROK_CF_STATE_PATH: /app/storage/grok_cf.json
+  KLEIN_GROK_UPLOAD_NORMALIZE_JPEG: "true"
+  KLEIN_GROK_DYNAMIC_STATSIG: "true"
+  KLEIN_LOG_LEVEL: info
+  KLEIN_LOG_DIR: /app/logs
+  KLEIN_CORS_ORIGINS: ${KLEIN_CORS_ORIGINS:-http://localhost:17080,http://localhost:17088,http://127.0.0.1:17080,http://127.0.0.1:17088}
+  TZ: Asia/Shanghai
+
+x-resource-limits: &resource-limits
+  deploy:
+    resources:
+      limits:
+        cpus: "${KLEIN_CPU_LIMIT:-1}"
+        memory: "${KLEIN_MEM_LIMIT:-512M}"
+      reservations:
+        cpus: "0.1"
+        memory: "64M"
+
+services:
+  # ---------- 数据库 ----------
+  mysql:
+    image: mysql:8.0
+    container_name: klein-mysql
+    restart: unless-stopped
+    command:
+      - --default-authentication-plugin=caching_sha2_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --innodb-buffer-pool-size=256M
+      - --max_connections=100
+      - --binlog-expire-logs-seconds=86400
+      - --max-binlog-size=64M
+      - --sql-mode=STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION
+    environment:
+      MYSQL_ROOT_PASSWORD: ${KLEIN_MYSQL_ROOT_PASSWORD:-change-me-root-password}
+      MYSQL_DATABASE: klein_ai
+      MYSQL_USER: klein
+      MYSQL_PASSWORD: ${KLEIN_MYSQL_PASSWORD:-change-me-mysql-password}
+      TZ: Asia/Shanghai
+    ports:
+      - "${KLEIN_MYSQL_PORT:-23306}:3306"
+    volumes:
+      - klein-mysql-data:/var/lib/mysql
+      - ./mysql-init/01-run-migrations.sh:/docker-entrypoint-initdb.d/01-run-migrations.sh:ro
+      - ../backend/migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${KLEIN_MYSQL_ROOT_PASSWORD:-change-me-root-password}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [klein-net]
+    deploy:
+      resources:
+        limits:
+          cpus: "${KLEIN_MYSQL_CPU_LIMIT:-1}"
+          memory: "${KLEIN_MYSQL_MEM_LIMIT:-512M}"
+        reservations:
+          cpus: "0.25"
+          memory: "128M"
+
+  redis:
+    image: redis:7-alpine
+    container_name: klein-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${KLEIN_REDIS_PORT:-16379}:6379"
+    volumes:
+      - klein-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [klein-net]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+        reservations:
+          cpus: "0.1"
+          memory: "64M"
+
+  # ---------- FlareSolverr ----------
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: klein-flaresolverr
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      TZ: Asia/Shanghai
+    networks: [klein-net]
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "1G"
+        reservations:
+          cpus: "0.25"
+          memory: "256M"
+
+  # ---------- 后端服务 ----------
+  api:
+    image: kleinai/backend:prod
+    container_name: klein-api
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        VERSION: prod
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    entrypoint: ["/app/api"]
+    user: "0:0"
+    environment:
+      <<: *backend-env
+      KLEIN_NODE_ID: "1"
+    volumes:
+      - klein-logs:/app/logs
+      - klein-storage:/app/storage
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      flaresolverr: { condition: service_started }
+    networks: [klein-net]
+    restart: unless-stopped
+    <<: *resource-limits
+
+  admin:
+    image: kleinai/backend:prod
+    container_name: klein-admin
+    entrypoint: ["/app/admin"]
+    user: "0:0"
+    environment:
+      <<: *backend-env
+      KLEIN_NODE_ID: "2"
+    volumes:
+      - klein-logs:/app/logs
+      - klein-storage:/app/storage
+    depends_on:
+      api: { condition: service_started }
+    networks: [klein-net]
+    restart: unless-stopped
+    <<: *resource-limits
+
+  openai:
+    image: kleinai/backend:prod
+    container_name: klein-openai
+    entrypoint: ["/app/openai"]
+    user: "0:0"
+    environment:
+      <<: *backend-env
+      KLEIN_NODE_ID: "3"
+    volumes:
+      - klein-logs:/app/logs
+      - klein-storage:/app/storage
+    depends_on:
+      api: { condition: service_started }
+    networks: [klein-net]
+    restart: unless-stopped
+    <<: *resource-limits
+
+  worker:
+    image: kleinai/backend:prod
+    container_name: klein-worker
+    entrypoint: ["/app/worker"]
+    user: "0:0"
+    environment:
+      <<: *backend-env
+      KLEIN_NODE_ID: "4"
+    volumes:
+      - klein-logs:/app/logs
+      - klein-storage:/app/storage
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      flaresolverr: { condition: service_started }
+    networks: [klein-net]
+    restart: unless-stopped
+    <<: *resource-limits
+
+  # ---------- 注册机 ----------
+  registrar:
+    image: kleinai/registrar:prod
+    container_name: klein-registrar
+    build:
+      context: ../registrar
+      dockerfile: Dockerfile
+    environment:
+      TZ: Asia/Shanghai
+    expose: ["8080"]
+    volumes:
+      - klein-registrar-data:/app/data
+    depends_on:
+      flaresolverr: { condition: service_started }
+    networks: [klein-net]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "512M"
+        reservations:
+          cpus: "0.1"
+          memory: "128M"
+
+  # ---------- 前端 ----------
+  user-web:
+    image: kleinai/user-web:prod
+    container_name: klein-user-web
+    build:
+      context: ../frontend
+      dockerfile: apps/user/Dockerfile
+    ports:
+      - "${KLEIN_USER_WEB_PORT:-17080}:80"
+    volumes:
+      - ./nginx-dev/user-web.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [api, openai]
+    networks: [klein-net]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: "128M"
+        reservations:
+          cpus: "0.05"
+          memory: "32M"
+
+  admin-web:
+    image: kleinai/admin-web:prod
+    container_name: klein-admin-web
+    build:
+      context: ../frontend
+      dockerfile: apps/admin/Dockerfile
+    ports:
+      - "${KLEIN_ADMIN_WEB_PORT:-17088}:80"
+    volumes:
+      - ./nginx-dev/admin-web.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [admin]
+    networks: [klein-net]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: "128M"
+        reservations:
+          cpus: "0.05"
+          memory: "32M"
+
+volumes:
+  klein-mysql-data:
+  klein-redis-data:
+  klein-logs:
+  klein-storage:
+  klein-registrar-data:
+    name: klein-registrar-data
+
+networks:
+  klein-net:
+    name: klein-net
+    driver: bridge

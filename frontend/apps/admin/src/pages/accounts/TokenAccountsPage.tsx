@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -24,6 +25,7 @@ import { accountsApi, proxiesApi } from '../../lib/services';
 import type {
   AccountBatchAssignProxyBody,
   AccountBatchImportBody,
+  AccountBatchStatusBody,
   AccountCreateBody,
   AccountItem,
   AccountUpdateBody,
@@ -33,6 +35,7 @@ import { toast } from '../../stores/toast';
 
 type ProviderFilter = 'all' | 'gpt' | 'grok';
 type PlanTypeFilter = 'all' | 'basic' | 'super' | 'heavy';
+type StatusFilter = 'all' | 'enabled' | 'disabled' | 'broken' | 'invalid';
 type AuthType = 'api_key' | 'oauth' | 'cookie';
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
@@ -43,6 +46,21 @@ const PLAN_TYPE_OPTIONS = [
   { value: 'super', label: 'Super' },
   { value: 'heavy', label: 'Heavy' },
 ] as const;
+
+const STATUS_FILTER_OPTIONS = [
+  { value: 'all', label: '全部状态' },
+  { value: 'enabled', label: '正常' },
+  { value: 'disabled', label: '禁用' },
+  { value: 'broken', label: '熔断' },
+  { value: 'invalid', label: '失效' },
+] as const;
+
+const STATUS_FILTER_VALUE: Record<Exclude<StatusFilter, 'all'>, 0 | 1 | 2 | 3> = {
+  enabled: 1,
+  disabled: 0,
+  broken: 2,
+  invalid: 3,
+};
 
 function normalizeBaseURL(value?: string): string | undefined {
   const trimmed = (value || '').trim();
@@ -137,6 +155,7 @@ export default function TokenAccountsPage() {
 
   const [provider, setProvider] = useState<ProviderFilter>('all');
   const [planType, setPlanType] = useState<PlanTypeFilter>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [keyword, setKeyword] = useState('');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
@@ -145,17 +164,19 @@ export default function TokenAccountsPage() {
   const [openCreate, setOpenCreate] = useState(false);
   const [openImport, setOpenImport] = useState(false);
   const [openAssignProxy, setOpenAssignProxy] = useState(false);
+  const [openBatchStatus, setOpenBatchStatus] = useState(false);
   const [editTarget, setEditTarget] = useState<AccountItem | null>(null);
 
   const query = useMemo(
     () => ({
       provider: provider === 'all' ? undefined : provider,
       plan_type: planType === 'all' ? undefined : planType,
+      status: statusFilter === 'all' ? undefined : STATUS_FILTER_VALUE[statusFilter],
       keyword: keyword.trim() || undefined,
       page,
       page_size: pageSize,
     }),
-    [provider, planType, keyword, page, pageSize],
+    [provider, planType, statusFilter, keyword, page, pageSize],
   );
 
   const list = useQuery({
@@ -256,6 +277,43 @@ export default function TokenAccountsPage() {
     onError: (e: ApiError) => toast.error(e.message),
   });
 
+  const batchCheckInvalid = useMutation({
+    mutationFn: async (value: 'gpt' | 'grok' | '') => {
+      let current = 1;
+      let checked = 0;
+      let markedInvalid = 0;
+      const markedInvalidIDs: number[] = [];
+      const okIDs: number[] = [];
+      const failedIDs: number[] = [];
+      const batchSize = Math.min(Math.max(pageSize, 1), 1000);
+      for (;;) {
+        const res = await accountsApi.batchCheckInvalid(value || undefined, current, batchSize);
+        checked += res.checked;
+        markedInvalid += res.marked_invalid;
+        markedInvalidIDs.push(...res.marked_invalid_ids);
+        okIDs.push(...res.ok_ids);
+        failedIDs.push(...res.failed_ids);
+        if (res.has_more && res.next_page) {
+          current = res.next_page;
+          continue;
+        }
+        break;
+      }
+      return { checked, markedInvalid, markedInvalidIDs, okIDs, failedIDs };
+    },
+    onSuccess: (res) => {
+      refresh();
+      if (res.markedInvalid > 0) {
+        toast.warning(`检测 ${res.checked} 个账号，标记失效 ${res.markedInvalid} 个${res.failedIDs.length ? `，检测失败 ${res.failedIDs.length} 个` : ''}`);
+      } else if (res.failedIDs.length > 0) {
+        toast.warning(`检测 ${res.checked} 个账号，检测失败 ${res.failedIDs.length} 个`);
+      } else {
+        toast.success(`检测 ${res.checked} 个账号，全部正常`);
+      }
+    },
+    onError: (e: ApiError) => toast.error(e.message),
+  });
+
   const batchDelete = useMutation({
     mutationFn: (ids: number[]) => accountsApi.batchDelete(ids),
     onSuccess: (res) => {
@@ -273,6 +331,17 @@ export default function TokenAccountsPage() {
       setSelected(new Set());
       setOpenAssignProxy(false);
       toast.success(`已更新 ${res.updated} 个 Token 的代理`);
+    },
+    onError: (e: ApiError) => toast.error(e.message),
+  });
+
+  const batchStatus = useMutation({
+    mutationFn: (body: AccountBatchStatusBody) => accountsApi.batchStatus(body),
+    onSuccess: (res) => {
+      refresh();
+      setSelected(new Set());
+      setOpenBatchStatus(false);
+      toast.success(`已更新 ${res.updated} 个账号状态`);
     },
     onError: (e: ApiError) => toast.error(e.message),
   });
@@ -299,7 +368,7 @@ export default function TokenAccountsPage() {
 
   useEffect(() => {
     setSelected(new Set());
-  }, [provider, planType, keyword]);
+  }, [provider, planType, statusFilter, keyword]);
 
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
@@ -346,6 +415,17 @@ export default function TokenAccountsPage() {
             <Activity size={14} className={batchProbe.isPending ? 'animate-pulse' : ''} />
             批量检测用量
           </button>
+          <button
+            className="btn btn-warning btn-sm"
+            onClick={() => {
+              if (!confirm('检测失效账号会自动标记失效（401 或明确凭证失效）的账号；403 只记录失败不标记，确认继续？')) return;
+              batchCheckInvalid.mutate(provider === 'all' ? '' : provider);
+            }}
+            disabled={batchCheckInvalid.isPending}
+          >
+            <AlertTriangle size={14} className={batchCheckInvalid.isPending ? 'animate-pulse' : ''} />
+            检测失效账号
+          </button>
           <button className="btn btn-outline btn-sm" onClick={() => setOpenImport(true)}>
             <Upload size={14} /> 导入
           </button>
@@ -357,10 +437,18 @@ export default function TokenAccountsPage() {
             <ChevronDown size={14} /> 批量代理
           </button>
           <button
+            className="btn btn-outline btn-sm"
+            disabled={selected.size === 0 || batchStatus.isPending}
+            onClick={() => setOpenBatchStatus(true)}
+          >
+            <Power size={14} /> 批量状态
+          </button>
+          <button
             className="btn btn-danger btn-sm"
             disabled={selected.size === 0 || batchDelete.isPending}
             onClick={() => {
-              if (!confirm(`确认删除选中的 ${selected.size} 个账号吗？`)) return;
+              const scope = statusFilter === 'all' ? '' : `（当前筛选：${STATUS_FILTER_OPTIONS.find((item) => item.value === statusFilter)?.label || '指定状态'}）`;
+              if (!confirm(`确认删除选中的 ${selected.size} 个账号${scope}吗？`)) return;
               batchDelete.mutate([...selected]);
             }}
           >
@@ -372,13 +460,13 @@ export default function TokenAccountsPage() {
         </div>
       </header>
 
-      <div className="card card-section flex flex-wrap items-center gap-2 !py-2">
-        <div className="tabs">
+      <div className="card card-section grid gap-2 !py-2 md:grid-cols-[auto_minmax(180px,1fr)_auto_auto_auto] md:items-center">
+        <div className="tabs w-full md:w-auto">
           {(['all', 'gpt', 'grok'] as const).map((item) => (
             <button
               key={item}
               type="button"
-              className="tab"
+              className="tab flex-1 md:flex-none"
               aria-selected={provider === item}
               onClick={() => {
                 setProvider(item);
@@ -390,7 +478,7 @@ export default function TokenAccountsPage() {
           ))}
         </div>
         <input
-          className="input input-sm min-w-[180px] flex-1"
+          className="input input-sm"
           placeholder="搜索名称或备注"
           value={keyword}
           onChange={(e) => {
@@ -398,21 +486,37 @@ export default function TokenAccountsPage() {
             setPage(1);
           }}
         />
-        <select
-          className="select select-sm min-w-[132px]"
-          value={planType}
-          onChange={(e) => {
-            setPlanType(e.target.value as PlanTypeFilter);
-            setPage(1);
-          }}
-        >
-          {PLAN_TYPE_OPTIONS.map((item) => (
-            <option key={item.value} value={item.value}>
-              {item.label}
-            </option>
-          ))}
-        </select>
-        <span className="whitespace-nowrap text-tiny text-text-tertiary">
+        <div className="grid grid-cols-2 gap-2 md:flex md:items-center md:gap-2">
+          <select
+            className="select select-sm md:w-[120px]"
+            value={planType}
+            onChange={(e) => {
+              setPlanType(e.target.value as PlanTypeFilter);
+              setPage(1);
+            }}
+          >
+            {PLAN_TYPE_OPTIONS.map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <select
+            className="select select-sm md:w-[112px]"
+            value={statusFilter}
+            onChange={(e) => {
+              setStatusFilter(e.target.value as StatusFilter);
+              setPage(1);
+            }}
+          >
+            {STATUS_FILTER_OPTIONS.map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <span className="whitespace-nowrap text-right text-tiny text-text-tertiary">
           共 <span className="font-medium tabular-nums text-text-secondary">{fmtNumber(total)}</span> 条
         </span>
       </div>
@@ -507,6 +611,9 @@ export default function TokenAccountsPage() {
                           </span>
                           <span className={`badge text-tiny ${item.has_access_token ? 'badge-success' : needsAttention ? 'badge-warning' : 'badge-outline'}`}>
                             AT {item.has_access_token ? '已取到' : '缺失'}
+                          </span>
+                          <span className={`badge text-tiny ${item.has_session_token ? 'badge-success' : 'badge-outline'}`}>
+                            ST {item.has_session_token ? '已存' : '未设'}
                           </span>
                         </div>
                         <div className={`inline-flex flex-wrap items-center gap-1 ${check.cls}`}>
@@ -674,6 +781,16 @@ export default function TokenAccountsPage() {
           onClose={() => setOpenAssignProxy(false)}
           onSubmit={(body) => batchAssignProxy.mutate(body)}
           submitting={batchAssignProxy.isPending}
+        />
+      )}
+
+      {openBatchStatus && (
+        <BatchStatusDialog
+          accountIDs={selectedAccountIDs}
+          selectedCount={selectedAccountIDs.length}
+          onClose={() => setOpenBatchStatus(false)}
+          onSubmit={(body) => batchStatus.mutate(body)}
+          submitting={batchStatus.isPending}
         />
       )}
 
@@ -884,7 +1001,7 @@ function CreateDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 }
 
 function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
-  const [importMode, setImportMode] = useState<'lines' | 'sub2api'>('lines');
+  const [importMode, setImportMode] = useState<'lines' | 'sub2api' | 'session_tokens'>('lines');
   const [body, setBody] = useState<AccountBatchImportBody>({
     provider: 'gpt',
     auth_type: 'oauth',
@@ -988,6 +1105,9 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
           <button type="button" className={`btn btn-sm ${importMode === 'sub2api' ? 'btn-primary' : 'btn-outline'}`} onClick={() => setImportMode('sub2api')}>
             JSON 导入
           </button>
+          <button type="button" className={`btn btn-sm ${importMode === 'session_tokens' ? 'btn-primary' : 'btn-outline'}`} onClick={() => setImportMode('session_tokens')}>
+            Session Token 导入
+          </button>
         </div>
 
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -1004,13 +1124,15 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
               <option value="grok">GROK</option>
             </select>
           </Field>
-          <Field label="认证类型">
-            <select className="select select-sm" value={body.auth_type} onChange={(e) => setBody((prev) => ({ ...prev, auth_type: e.target.value as AuthType }))}>
-              <option value="api_key">API Key</option>
-              <option value="oauth">OAuth</option>
-              <option value="cookie">Grok Token</option>
-            </select>
-          </Field>
+          {importMode !== 'session_tokens' && (
+            <Field label="认证类型">
+              <select className="select select-sm" value={body.auth_type} onChange={(e) => setBody((prev) => ({ ...prev, auth_type: e.target.value as AuthType }))}>
+                <option value="api_key">API Key</option>
+                <option value="oauth">OAuth</option>
+                <option value="cookie">Grok Token</option>
+              </select>
+            </Field>
+          )}
           <Field label="默认代理">
             <select
               className="select select-sm"
@@ -1061,6 +1183,45 @@ function ImportDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
               <textarea
                 className="textarea min-h-[180px] font-mono text-small"
                 placeholder={linePlaceholder}
+                value={body.text || ''}
+                onChange={(e) => setBody((prev) => ({ ...prev, text: e.target.value }))}
+              />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <button type="button" className="btn btn-outline btn-md" onClick={onClose}>
+                取消
+              </button>
+              <button type="submit" className="btn btn-primary btn-md" disabled={importLines.isPending}>
+                {importLines.isPending ? '导入中…' : '开始导入'}
+              </button>
+            </div>
+          </form>
+        ) : importMode === 'session_tokens' ? (
+          <form
+            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!body.text?.trim()) {
+                toast.error('请粘贴 Session Token 列表');
+                return;
+              }
+              importLines.mutate({
+                format: 'session_tokens',
+                provider: body.provider,
+                base_url: normalizeBaseURL(body.base_url),
+                proxy_id: body.proxy_id && body.proxy_id > 0 ? body.proxy_id : undefined,
+                weight: body.weight || 10,
+                text: body.text,
+              });
+            }}
+          >
+            <div className="card card-flat p-3 text-small text-text-secondary">
+              Session Token 导入模式：每行一个 session_token，系统会自动填充占位的 access_token 和 refresh_token。导入后需手动刷新 OAuth 获取有效的 access_token。
+            </div>
+            <Field label="每行一个 Session Token">
+              <textarea
+                className="textarea min-h-[180px] font-mono text-small"
+                placeholder="每行一个 session_token..."
                 value={body.text || ''}
                 onChange={(e) => setBody((prev) => ({ ...prev, text: e.target.value }))}
               />
@@ -1237,6 +1398,57 @@ function BatchAssignProxyDialog({
           </button>
           <button type="button" className="btn btn-primary btn-md" onClick={submit} disabled={submitting || proxiesQ.isLoading || proxies.length === 0}>
             {submitting ? '保存中…' : '确认分配'}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function BatchStatusDialog({
+  accountIDs,
+  selectedCount,
+  onClose,
+  onSubmit,
+  submitting,
+}: {
+  accountIDs: number[];
+  selectedCount: number;
+  onClose: () => void;
+  onSubmit: (body: AccountBatchStatusBody) => void;
+  submitting: boolean;
+}) {
+  const [status, setStatus] = useState<0 | 1 | 2>(1);
+  const selectedLabel = statusLabel(status).label;
+
+  const submit = () => {
+    if (accountIDs.length === 0) {
+      toast.error('请先选择账号');
+      return;
+    }
+    if (!confirm(`确认将选中的 ${selectedCount} 个账号状态改为“${selectedLabel}”吗？`)) return;
+    onSubmit({ ids: accountIDs, status });
+  };
+
+  return (
+    <Modal title="批量修改状态" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="card card-flat p-3 text-small text-text-secondary">
+          已选择 <span className="font-medium text-text-primary">{selectedCount}</span> 个账号。改为“正常”时会清除熔断冷却和最近错误。
+        </div>
+        <Field label="目标状态">
+          <select className="select" value={status} onChange={(e) => setStatus(Number(e.target.value) as 0 | 1 | 2)}>
+            <option value={1}>正常</option>
+            <option value={0}>禁用</option>
+            <option value={2}>熔断</option>
+          </select>
+        </Field>
+        <div className="flex justify-end gap-2">
+          <button type="button" className="btn btn-outline btn-md" onClick={onClose}>
+            取消
+          </button>
+          <button type="button" className="btn btn-primary btn-md" onClick={submit} disabled={submitting}>
+            {submitting ? '保存中…' : '确认修改'}
           </button>
         </div>
       </div>

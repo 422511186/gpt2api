@@ -25,6 +25,8 @@ dist/
 .gocache/
 .tmp/
 **/.gocache/
+__pycache__/
+*.py[cod]
 
 # Local operation artifacts
 backend/img/
@@ -47,3 +49,5 @@ Thumbs.db
 
 # 大图素材原档（按需）
 /assets/raw/
+deploy/.env.local
+deploy/env/.env.local

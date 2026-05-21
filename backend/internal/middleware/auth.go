@@ -28,24 +28,47 @@ func AuthJWT(mgr *jwtx.Manager, expectSub jwtx.Subject) gin.HandlerFunc {
 			return
 		}
 		tok := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-		claims, err := mgr.ParseAccess(tok)
-		if err != nil {
-			response.Fail(c, errcode.TokenExpired.Wrap(err))
-			return
-		}
-		if claims.Subject != expectSub {
-			response.Fail(c, errcode.TokenInvalid)
-			return
-		}
-
-		ctx := context.WithValue(c.Request.Context(), CtxUID, claims.UID)
-		ctx = context.WithValue(ctx, CtxClaims, claims)
-		ctx = context.WithValue(ctx, CtxSubject, claims.Subject)
-		c.Request = c.Request.WithContext(ctx)
-		c.Set(string(CtxUID), claims.UID)
-		c.Set(string(CtxClaims), claims)
-		c.Next()
+		validateAndSet(c, mgr, expectSub, tok)
 	}
+}
+
+// AuthJWTOrQuery 校验 Bearer token，若 header 缺失则回退从 query "token" 读取。
+// 适用于 SSE/EventSource 等无法设置自定义 header 的场景。
+func AuthJWTOrQuery(mgr *jwtx.Manager, expectSub jwtx.Subject) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		var tok string
+		if strings.HasPrefix(auth, "Bearer ") {
+			tok = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		} else {
+			tok = c.Query("token")
+		}
+		if tok == "" {
+			response.Fail(c, errcode.Unauthorized)
+			return
+		}
+		validateAndSet(c, mgr, expectSub, tok)
+	}
+}
+
+func validateAndSet(c *gin.Context, mgr *jwtx.Manager, expectSub jwtx.Subject, tok string) {
+	claims, err := mgr.ParseAccess(tok)
+	if err != nil {
+		response.Fail(c, errcode.TokenExpired.Wrap(err))
+		return
+	}
+	if claims.Subject != expectSub {
+		response.Fail(c, errcode.TokenInvalid)
+		return
+	}
+
+	ctx := context.WithValue(c.Request.Context(), CtxUID, claims.UID)
+	ctx = context.WithValue(ctx, CtxClaims, claims)
+	ctx = context.WithValue(ctx, CtxSubject, claims.Subject)
+	c.Request = c.Request.WithContext(ctx)
+	c.Set(string(CtxUID), claims.UID)
+	c.Set(string(CtxClaims), claims)
+	c.Next()
 }
 
 // MustUID 从 ctx / gin.Context 取 UID（若不存在则 panic，确保中间件已生效）。

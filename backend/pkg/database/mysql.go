@@ -4,6 +4,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -16,6 +17,7 @@ import (
 )
 
 // NewMySQL 用 GORM 创建 MySQL 连接（含连接池配置与慢查询日志）。
+// 在生产环境下会重试连接以应对 Docker DNS 启动时序问题。
 func NewMySQL(c *config.MySQL) (*gorm.DB, error) {
 	if c.DSN == "" {
 		return nil, fmt.Errorf("mysql dsn empty")
@@ -31,12 +33,38 @@ func NewMySQL(c *config.MySQL) (*gorm.DB, error) {
 		},
 	)
 
-	db, err := gorm.Open(mysql.Open(c.DSN), &gorm.Config{
-		Logger:                                   gormLog,
-		PrepareStmt:                              true,
-		DisableForeignKeyConstraintWhenMigrating: true,
-		NowFunc:                                  func() time.Time { return time.Now().UTC() },
-	})
+	// 生产环境重试连接，应对 Docker DNS 解析时序问题
+	// 通过 DSN 判断是否为生产环境（包含容器名如 mysql、redis 等）
+	maxRetries := 1
+	retryDelay := time.Duration(0)
+	// 如果 DSN 中包含容器名（非 localhost/127.0.0.1），认为是容器环境需要重试
+	if strings.Contains(c.DSN, "tcp(mysql:") || strings.Contains(c.DSN, "@tcp(mysql:") {
+		maxRetries = 5
+		retryDelay = 3 * time.Second
+	}
+
+	var db *gorm.DB
+	var err error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		db, err = gorm.Open(mysql.Open(c.DSN), &gorm.Config{
+			Logger:                                   gormLog,
+			PrepareStmt:                              true,
+			DisableForeignKeyConstraintWhenMigrating: true,
+			NowFunc:                                  func() time.Time { return time.Now().UTC() },
+		})
+		if err == nil {
+			break
+		}
+		if attempt < maxRetries {
+			logger.L().Warn("mysql connection failed, retrying...",
+				zap.Int("attempt", attempt),
+				zap.Int("max_retries", maxRetries),
+				zap.Duration("delay", retryDelay),
+				zap.Error(err),
+			)
+			time.Sleep(retryDelay)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("gorm open: %w", err)
 	}

@@ -1,7 +1,7 @@
 # ----- 多阶段构建：构建 4 个独立二进制并打入同一镜像 -----
 FROM golang:1.24-alpine AS builder
 
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOPROXY=https://goproxy.cn,direct
 
 WORKDIR /src
 
@@ -29,10 +29,13 @@ RUN go build -trimpath -ldflags="-s -w \
         -X github.com/kleinai/backend/pkg/version.Build=${VERSION}" \
     -o /out/worker ./cmd/worker
 
-# ----- 运行阶段：distroless · 非 root -----
-FROM gcr.io/distroless/static-debian12:nonroot
+# ----- 运行阶段：Alpine · 非 root -----
+FROM alpine:3.18
 
 WORKDIR /app
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    adduser -D -u 65532 nonroot
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /usr/share/zoneinfo                 /usr/share/zoneinfo

@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import { CheckCircle2, X, AlertTriangle, Info } from 'lucide-react';
+import { CheckCircle2, X, AlertTriangle, Info, AlertCircle } from 'lucide-react';
 
 import { useToastStore } from '../stores/toast';
 
@@ -7,12 +7,14 @@ const ICONS = {
   success: CheckCircle2,
   error: AlertTriangle,
   info: Info,
+  warning: AlertCircle,
 } as const;
 
 const COLOR = {
   success: 'border-success bg-surface-1 text-success',
   error: 'border-danger bg-surface-1 text-danger',
   info: 'border-klein-500 bg-surface-1 text-klein-500',
+  warning: 'border-warning bg-surface-1 text-warning',
 } as const;
 
 export function Toaster() {

@@ -5,7 +5,10 @@ import type {
   AccountBatchImportResult,
   AccountBatchAssignProxyBody,
   AccountBatchAssignProxyResp,
+  AccountBatchCheckInvalidResp,
   AccountBatchRefreshResp,
+  AccountBatchStatusBody,
+  AccountBatchStatusResp,
   AccountBulkOpResult,
   AccountCreateBody,
   AccountItem,
@@ -40,6 +43,8 @@ import type {
   ProxyTestResp,
   ProxyUpdateBody,
   SystemSettings,
+  RegisterConfig,
+  RegisterConfigReq,
 } from './types';
 
 export const authApi = {
@@ -128,7 +133,7 @@ export const promoApi = {
 
 export interface AccountListQuery {
   provider?: 'gpt' | 'grok';
-  status?: -1 | 0 | 1 | 2;
+  status?: -1 | 0 | 1 | 2 | 3;
   plan_type?: 'basic' | 'super' | 'heavy';
   keyword?: string;
   page?: number;
@@ -180,11 +185,24 @@ export const accountsApi = {
       method: 'POST',
       data: { provider: provider ?? '', page, page_size: pageSize },
     }),
+  batchCheckInvalid: (provider?: 'gpt' | 'grok' | '', page = 1, pageSize = 20) =>
+    request<AccountBatchCheckInvalidResp>({
+      url: '/accounts/batch-check-invalid',
+      method: 'POST',
+      data: { provider: provider ?? '', page, page_size: pageSize },
+      timeout: 120_000, // 批量检测耗时较长，设置 2 分钟超时
+    }),
   batchDelete: (ids: number[]) =>
     request<AccountBulkOpResult>({
       url: '/accounts/batch-delete',
       method: 'POST',
       data: { ids },
+    }),
+  batchStatus: (body: AccountBatchStatusBody) =>
+    request<AccountBatchStatusResp>({
+      url: '/accounts/batch-status',
+      method: 'POST',
+      data: body,
     }),
   purge: (body: AccountPurgeBody) =>
     request<AccountBulkOpResult>({
@@ -255,4 +273,15 @@ export const systemApi = {
       method: 'DELETE',
       data: body,
     }),
+};
+
+// ==================== 注册机 ====================
+
+export const registerApi = {
+  get: () => request<{ register: RegisterConfig }>({ url: '/register', method: 'GET' }),
+  update: (body: RegisterConfigReq) =>
+    request<{ register: RegisterConfig }>({ url: '/register', method: 'POST', data: body }),
+  start: () => request<{ register: RegisterConfig }>({ url: '/register/start', method: 'POST' }),
+  stop: () => request<{ register: RegisterConfig }>({ url: '/register/stop', method: 'POST' }),
+  reset: () => request<{ register: RegisterConfig }>({ url: '/register/reset', method: 'POST' }),
 };

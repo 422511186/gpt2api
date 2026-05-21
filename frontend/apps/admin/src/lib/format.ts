@@ -39,6 +39,8 @@ export function statusLabel(s: number): { label: string; tone: 'ok' | 'warn' | '
       return { label: '禁用', tone: 'mute' };
     case 2:
       return { label: '熔断', tone: 'warn' };
+    case 3:
+      return { label: '失效', tone: 'err' };
     case -1:
       return { label: '已删除', tone: 'err' };
     default:

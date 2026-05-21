@@ -44,6 +44,8 @@ type Request struct {
 	// Credential 是 Account.CredentialEnc 解密后的明文（API Key / Cookie / OAuth Token）。
 	// 调用方负责解密，provider 不再持有 AESGCM。
 	Credential string
+	// SessionToken 是 ChatGPT Web 登录态 Cookie，仅 Web 路由使用。
+	SessionToken string
 	// BaseURL 优先级：account.base_url > provider 默认。
 	BaseURL  string
 	ProxyURL string
